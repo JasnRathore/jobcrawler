@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -38,14 +39,19 @@ var (
 func main() {
 	words := flag.String("words", "", "file with company names or slugs, one per line")
 	brute := flag.Bool("brute", false, "also brute-force slugs (low priority)")
-	bench := flag.Bool("bench", false, "benchmark requests without writing to the database")
+	bench := flag.Bool("bench", false, "benchmark requests without modifying local.db")
+	resume := flag.Bool("resume", false, "resume or checkpoint brute-force progress (requires --brute)")
+	update := flag.Bool("update", false, "update indexed data")
+	updateJobsFlag := flag.Bool("jobs", false, "fetch and refresh jobs for all known companies")
+	browse := flag.Bool("browse", false, "launch the local job browser")
+	browseAddress := flag.String("addr", "127.0.0.1:8080", "job browser listen address")
 	workers := flag.Int("workers", 64, "concurrent workers")
 	rps := flag.Float64("rps", 50, "max requests per second")
 	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
 	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
 	flag.Parse()
 
-	if minSlugLength < 1 || maxSlugLength < minSlugLength {
+	if minSlugLength < 1 || maxSlugLength < minSlugLength || (*brute && maxSlugLength > 13) {
 		log.Fatalf("invalid length range: min=%d max=%d", minSlugLength, maxSlugLength)
 	}
 	if *workers < 1 {
@@ -54,17 +60,42 @@ func main() {
 	if *rps <= 0 {
 		log.Fatal("rps must be greater than 0")
 	}
-	if *brute && maxSlugLength > 5 {
-		log.Printf("warning: brute force up to length %d means ~%d candidates",
+	if *resume && (!*brute || *bench || *words != "" || *browse || *update) {
+		log.Fatal("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
+	}
+	if *update != *updateJobsFlag {
+		log.Fatal("--update and --jobs must be used together")
+	}
+	if *bench && *update {
+		log.Fatal("--bench cannot be combined with --update or --jobs")
+	}
+	if *browse && (*bench || *update) {
+		log.Fatal("--browse cannot be combined with --bench or --update")
+	}
+	if *brute && maxSlugLength >= 6 {
+		log.Printf("warning: brute force up to length %d means %d candidates",
 			maxSlugLength, bruteCount(minSlugLength, maxSlugLength))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	var database *db.DB
-	if !*bench {
-		var err error
+	var (
+		database       *db.DB
+		err            error
+		benchmarkClean func()
+	)
+	if *bench {
+		database, benchmarkClean, err = newBenchmarkDatabase(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer func() {
+			if benchmarkClean != nil {
+				benchmarkClean()
+			}
+		}()
+	} else {
 		database, err = db.New(ctx, "local.db")
 		if err != nil {
 			log.Fatal(err)
@@ -82,24 +113,21 @@ func main() {
 	if *bench {
 		stats = newBenchmarkStats()
 	}
-
-	jobs := make(chan string, 1024)
-	var wg sync.WaitGroup
-
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for slug := range jobs {
-				err := checkCompany(ctx, client, limiter, database, slug, stats)
-				if stats != nil {
-					stats.recordCheck(err != nil)
-				} else if err != nil {
-					log.Printf("%s: %v", slug, err)
-				}
-			}
-		}()
+	if *browse {
+		if err := serveJobBrowser(ctx, database, *browseAddress); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
+	if *update && *updateJobsFlag {
+		client.Timeout = 30 * time.Second
+		if err := updateAllJobs(ctx, database, client, limiter, *workers); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	pool := newCheckPool(ctx, client, limiter, database, stats, *workers)
 
 	seen := make(map[string]struct{})
 	emit := func(slug string) bool {
@@ -109,13 +137,12 @@ func main() {
 		if _, ok := seen[slug]; ok {
 			return true
 		}
-		seen[slug] = struct{}{}
-		select {
-		case jobs <- slug:
+		_, submitted := pool.submit(slug)
+		if submitted {
+			seen[slug] = struct{}{}
 			return true
-		case <-ctx.Done():
-			return false
 		}
+		return false
 	}
 
 	started := time.Now()
@@ -124,30 +151,59 @@ func main() {
 			log.Printf("wordlist: %v", err)
 		}
 	}
+	pool.flush()
+	var runErr error
 	if *brute {
-		for length := minSlugLength; length <= maxSlugLength && ctx.Err() == nil; length++ {
-			generate(length, make([]byte, 0, length), emit)
-		}
+		runErr = runBruteForce(ctx, pool, seen, database, minSlugLength, maxSlugLength, *resume)
 	}
 
-	close(jobs)
-	wg.Wait()
+	pool.close()
 	if stats != nil {
 		stats.print(time.Since(started))
+	}
+	if runErr != nil {
+		if benchmarkClean != nil {
+			benchmarkClean()
+			benchmarkClean = nil
+		}
+		log.Fatal(runErr)
 	}
 }
 
 // bruteCount returns how many candidates brute force would generate.
-func bruteCount(min, max int) int {
-	total := 0
+func bruteCount(min, max int) int64 {
+	total := int64(0)
 	for l := min; l <= max; l++ {
-		n := 1
+		n := int64(1)
 		for i := 0; i < l; i++ {
-			n *= len(alphabet)
+			n *= int64(len(alphabet))
 		}
 		total += n
 	}
 	return total
+}
+
+func newBenchmarkDatabase(ctx context.Context) (*db.DB, func(), error) {
+	dir, err := os.MkdirTemp("", "crawler-benchmark-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create temporary benchmark database directory: %w", err)
+	}
+	database, err := db.New(ctx, filepath.Join(dir, "benchmark.db"))
+	if err != nil {
+		if removeErr := os.RemoveAll(dir); removeErr != nil {
+			return nil, nil, fmt.Errorf("open temporary benchmark database: %w (cleanup failed: %v)", err, removeErr)
+		}
+		return nil, nil, fmt.Errorf("open temporary benchmark database: %w", err)
+	}
+	cleanup := func() {
+		if err := database.Close(); err != nil {
+			log.Printf("close temporary benchmark database: %v", err)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("remove temporary benchmark database: %v", err)
+		}
+	}
+	return database, cleanup, nil
 }
 
 func newClient(workers int) *http.Client {
@@ -198,18 +254,6 @@ func variants(name string) []string {
 	return []string{joined, hyphen, joined + "hq", joined + "inc", joined + "careers"}
 }
 
-func generate(length int, buf []byte, emit func(string) bool) bool {
-	if len(buf) == length {
-		return emit(string(buf))
-	}
-	for i := 0; i < len(alphabet); i++ {
-		if !generate(length, append(buf, alphabet[i]), emit) {
-			return false
-		}
-	}
-	return true
-}
-
 func checkCompany(
 	ctx context.Context,
 	client *http.Client,
@@ -246,7 +290,7 @@ func checkCompany(
 		}
 		if err == nil {
 			switch {
-			case res.StatusCode == http.StatusOK:
+			case res.StatusCode == http.StatusOK || res.StatusCode == http.StatusNoContent:
 				if database != nil {
 					if err := database.AddCompany(ctx, slug); err != nil {
 						return fmt.Errorf("saving company: %w", err)
