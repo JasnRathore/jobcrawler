@@ -1,0 +1,169 @@
+# Job Board Crawler
+
+A command-line tool that discovers company job boards, indexes job listings from
+supported providers, and serves a local browser for searching and bookmarking
+those listings.
+
+## Requirements
+
+- Go 1.27.3 or later
+- Network access to the selected job-board provider
+
+Run commands from the repository directory. The program creates and uses
+`local.db` in the current working directory.
+
+## Quick start
+
+```powershell
+# See all command-line flags
+go run . -h
+
+# Discover Greenhouse companies from a word list
+go run . --greenhouse --words companies.txt
+
+# Discover Lever companies by trying slugs from length 3 through 4
+go run . --lever --brute --min 3 --max 4 --resume
+
+# Fetch jobs for every discovered company, across all providers
+go run . --update --jobs
+
+# Browse indexed jobs
+go run . --browse
+```
+
+By default, discovery uses Greenhouse. The provider flags select exactly one
+provider: `--greenhouse`, `--lever`, or `--workable`.
+
+## Discover companies
+
+### Word lists
+
+Pass a text file with one company name or slug per line. Word-list discovery
+requires an explicit provider flag:
+
+```powershell
+go run . --greenhouse --words companies.txt
+go run . --lever --words companies.txt
+go run . --workable --words companies.txt
+```
+
+For each non-empty name, the crawler lowercases it, removes common company
+suffixes, then checks likely slug variants: joined characters, hyphenated
+characters, and the joined form with `hq`, `inc`, or `careers` appended.
+Candidates outside the selected `--min` and `--max` lengths are skipped.
+Duplicate candidates from the same run are checked once.
+
+### Brute force
+
+Brute force checks every lowercase alphabetic slug in the selected length
+range. It works with all supported providers:
+
+```powershell
+go run . --greenhouse --brute --min 3 --max 3
+go run . --lever --brute --min 3 --max 4 --resume
+go run . --workable --brute --min 2 --max 3 --resume
+```
+
+The default range is 4–5 characters. The maximum length is 13 when brute
+force is enabled; large ranges can take a very long time. Use `--resume` to
+save progress in provider-specific checkpoints in `local.db` and continue that
+same provider and length range later. `--resume` requires `--brute`.
+
+Failed brute-force slugs are appended to `failed.txt`, one per line, so they
+can be reviewed or retried. With `--resume`, a checkpoint continues if it has
+at most five failed checks; more than five failures stop that checkpoint
+without advancing its saved position. Word-list mode generates variants from
+each line, so it may check additional variants when retrying failed slugs.
+
+You can combine `--words` and `--brute` in one run, but word-list mode requires
+an explicit provider. Candidates already submitted from the word list are
+skipped during brute force in that run.
+
+## Refresh jobs
+
+After discovering companies, fetch and refresh jobs for all known companies
+across every provider:
+
+```powershell
+go run . --update --jobs
+```
+
+Both `--update` and `--jobs` are required together. Failed company updates are
+reported and cause the command to exit with an error. Successfully updated
+companies are checkpointed in `local.db`; rerunning the same command skips
+those companies and retries any that failed. Checkpoints are cleared after all
+company updates succeed, so the next independent update run refreshes everyone.
+
+## Browse jobs
+
+Start the local browser:
+
+```powershell
+go run . --browse
+```
+
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). The browser searches jobs
+across providers and supports:
+
+- Search by job title, company, and location; optionally include descriptions
+- Filter by location, posting date range, employment type, and workplace type
+- Save jobs and switch between all jobs and saved jobs
+- Open the original listing and application links
+
+To listen on another address or port, use `--addr`:
+
+```powershell
+go run . --browse --addr 127.0.0.1:9090
+```
+
+## Benchmark requests
+
+Measure discovery request performance without modifying `local.db`:
+
+```powershell
+go run . --bench --greenhouse --brute --min 2 --max 2
+go run . --bench --lever --words companies.txt
+```
+
+Benchmark mode uses a temporary database and prints request, retry, status,
+latency, and company-check statistics when the run finishes. It cannot be
+combined with `--update`/`--jobs`, `--browse`, or `--resume`.
+
+## Flags
+
+| Flag | Default | Description |
+|---|---:|---|
+| `--greenhouse` | Selected if no provider flag is given | Discover companies on Greenhouse |
+| `--lever` | Off | Discover companies on Lever |
+| `--workable` | Off | Discover companies on Workable |
+| `--words FILE` | None | Read company names or slugs from a file, one per line; requires an explicit provider |
+| `--brute` | Off | Brute-force slugs in the selected length range |
+| `--resume` | Off | Save/resume brute-force checkpoints; requires `--brute` |
+| `--min N` | `4` | Minimum candidate slug length |
+| `--max N` | `5` | Maximum candidate slug length; brute force allows at most `13` |
+| `--workers N` | `64` | Number of concurrent workers; must be at least `1` |
+| `--rps N` | `50` | Maximum request rate; must be greater than `0` |
+| `--bench` | Off | Benchmark discovery without changing `local.db` |
+| `--update --jobs` | Off | Refresh indexed jobs for every discovered company |
+| `--browse` | Off | Start the local job browser |
+| `--addr ADDRESS` | `127.0.0.1:8080` | Browser listen address |
+
+Only one provider flag may be selected. If none is provided, Greenhouse is
+used. `--words` requires an explicit provider even though Greenhouse is the
+default for other discovery modes.
+
+## Data and recovery
+
+The database is named `local.db` in the current directory. It stores discovered
+companies, brute-force checkpoints, indexed jobs, and bookmarks. The crawler
+creates/migrates its schema on startup. Back up `local.db` while the crawler is
+stopped; if SQLite sidecar files such as `local.db-wal` or `local.db-shm` exist,
+preserve them together with the database.
+
+## Development
+
+Run the test suite:
+
+```powershell
+go test ./...
+```

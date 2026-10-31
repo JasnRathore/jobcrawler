@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +71,140 @@ func TestBruteCheckpointResumesAndOnlyMovesForward(t *testing.T) {
 	}
 }
 
+func TestBruteCheckpointsAreProviderScoped(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "provider-checkpoint.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	const alphabet = "abc"
+	position, err := database.StartProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 2, alphabet, 12)
+	if err != nil || position != 0 {
+		t.Fatalf("new Greenhouse position=%d err=%v", position, err)
+	}
+	if err := database.SaveProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 2, alphabet, 7, 12); err != nil {
+		t.Fatal(err)
+	}
+	position, err = database.StartProviderBruteCheckpoint(ctx, providerLever, 1, 2, alphabet, 12)
+	if err != nil || position != 0 {
+		t.Fatalf("new Lever position=%d err=%v; checkpoint must not inherit Greenhouse progress", position, err)
+	}
+	position, err = database.StartProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 2, alphabet, 12)
+	if err != nil || position != 7 {
+		t.Fatalf("resumed Greenhouse position=%d err=%v, want 7", position, err)
+	}
+}
+
+func TestRunBruteForceSupportsAllProviders(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "all-providers.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	for _, provider := range registeredProviders() {
+		t.Run(provider, func(t *testing.T) {
+			var mu sync.Mutex
+			requests := 0
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				mu.Lock()
+				requests++
+				mu.Unlock()
+				return providerResponse(req, http.StatusNotFound, ""), nil
+			})}
+			pool := newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), database, nil, provider, 4)
+			if err := runBruteForce(ctx, pool, nil, database, 1, 1, true, filepath.Join(t.TempDir(), "failed.txt")); err != nil {
+				t.Fatal(err)
+			}
+			if failures := pool.close(); failures != 0 {
+				t.Fatalf("check pool reported %d failures", failures)
+			}
+
+			position, err := database.StartProviderBruteCheckpoint(ctx, provider, 1, 1, alphabet, bruteCount(1, 1))
+			if err != nil || position != bruteCount(1, 1) {
+				t.Fatalf("%s checkpoint position=%d err=%v, want %d", provider, position, err, bruteCount(1, 1))
+			}
+			mu.Lock()
+			gotRequests := requests
+			mu.Unlock()
+			wantRequests := int(bruteCount(1, 1))
+			if provider == providerLever {
+				wantRequests *= 2
+			}
+			if gotRequests != wantRequests {
+				t.Fatalf("%s made %d requests, want %d", provider, gotRequests, wantRequests)
+			}
+		})
+	}
+}
+
+func TestRunBruteForceSavesFailuresAndContinuesUpToFivePerCheckpoint(t *testing.T) {
+	for _, failureCount := range []int{5, 6} {
+		t.Run(strconv.Itoa(failureCount), func(t *testing.T) {
+			ctx := context.Background()
+			database, err := db.New(ctx, filepath.Join(t.TempDir(), "failed-checkpoint.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+
+			failedSlugs := make(map[string]bool)
+			for i := 0; i < failureCount; i++ {
+				failedSlugs[bruteSlugAt(1, 1, int64(i))] = true
+			}
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				status := http.StatusNotFound
+				slug := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+				if failedSlugs[slug] {
+					status = http.StatusBadRequest
+				}
+				return providerResponse(req, status, ""), nil
+			})}
+			pool := newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), database, nil, providerGreenhouse, 1)
+			failedPath := filepath.Join(t.TempDir(), "failed.txt")
+			runErr := runBruteForce(ctx, pool, nil, database, 1, 1, true, failedPath)
+			if failures := pool.close(); failures != 0 {
+				t.Fatalf("check pool reported %d failures", failures)
+			}
+
+			if failureCount == maxCheckpointFailures && runErr != nil {
+				t.Fatalf("run stopped with %d failures: %v", failureCount, runErr)
+			}
+			if failureCount > maxCheckpointFailures && runErr == nil {
+				t.Fatal("run continued despite exceeding the checkpoint failure limit")
+			}
+			position, err := database.StartProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 1, alphabet, bruteCount(1, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantPosition := int64(0)
+			if failureCount <= maxCheckpointFailures {
+				wantPosition = bruteCount(1, 1)
+			}
+			if position != wantPosition {
+				t.Fatalf("checkpoint position=%d, want %d", position, wantPosition)
+			}
+
+			content, err := os.ReadFile(failedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+			if len(lines) != failureCount {
+				t.Fatalf("failed.txt contains %d entries, want %d: %q", len(lines), failureCount, content)
+			}
+			for i, slug := range lines {
+				if want := bruteSlugAt(1, 1, int64(i)); slug != want {
+					t.Errorf("failed.txt entry %d = %q, want %q", i, slug, want)
+				}
+			}
+		})
+	}
+}
+
 func TestRunBruteForceContinuesFromSavedPosition(t *testing.T) {
 	ctx := context.Background()
 	database, err := db.New(ctx, filepath.Join(t.TempDir(), "continue.db"))
@@ -100,11 +236,11 @@ func TestRunBruteForceContinuesFromSavedPosition(t *testing.T) {
 		}, nil
 	})}
 	newPool := func() *checkPool {
-		return newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), database, nil, 4)
+		return newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), database, nil, providerGreenhouse, 4)
 	}
 
 	pool := newPool()
-	if err := runBruteForce(ctx, pool, nil, database, 1, 1, true); err != nil {
+	if err := runBruteForce(ctx, pool, nil, database, 1, 1, true, filepath.Join(t.TempDir(), "failed.txt")); err != nil {
 		t.Fatal(err)
 	}
 	pool.close()
@@ -120,7 +256,7 @@ func TestRunBruteForceContinuesFromSavedPosition(t *testing.T) {
 	}
 
 	pool = newPool()
-	if err := runBruteForce(ctx, pool, nil, database, 1, 1, true); err != nil {
+	if err := runBruteForce(ctx, pool, nil, database, 1, 1, true, filepath.Join(t.TempDir(), "failed.txt")); err != nil {
 		t.Fatal(err)
 	}
 	pool.close()
@@ -148,7 +284,7 @@ func TestCheckPoolUsesSharedCheckCompanyPathInBenchmarkMode(t *testing.T) {
 			Request:    req,
 		}, nil
 	})}
-	pool := newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), database, stats, 1)
+	pool := newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), database, stats, providerGreenhouse, 1)
 	if _, ok := pool.submit("example"); !ok {
 		t.Fatal("benchmark pool rejected candidate")
 	}

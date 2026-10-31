@@ -5,7 +5,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -40,6 +39,14 @@ func main() {
 	words := flag.String("words", "", "file with company names or slugs, one per line")
 	brute := flag.Bool("brute", false, "also brute-force slugs (low priority)")
 	bench := flag.Bool("bench", false, "benchmark requests without modifying local.db")
+	providerFlags := make(map[string]*bool)
+	for _, name := range registeredProviders() {
+		help := "select " + providerDisplayName(name) + " for company discovery"
+		if name == providerGreenhouse {
+			help += " (default)"
+		}
+		providerFlags[name] = flag.Bool(name, false, help)
+	}
 	resume := flag.Bool("resume", false, "resume or checkpoint brute-force progress (requires --brute)")
 	update := flag.Bool("update", false, "update indexed data")
 	updateJobsFlag := flag.Bool("jobs", false, "fetch and refresh jobs for all known companies")
@@ -59,6 +66,28 @@ func main() {
 	}
 	if *rps <= 0 {
 		log.Fatal("rps must be greater than 0")
+	}
+	selectedPortals := 0
+	selectedProvider := ""
+	for name, selected := range providerFlags {
+		if *selected {
+			selectedPortals++
+			selectedProvider = name
+		}
+	}
+	if selectedPortals > 1 {
+		log.Fatal("choose only one provider flag")
+	}
+	provider := providerGreenhouse
+	if selectedProvider != "" {
+		provider = selectedProvider
+	}
+	if *words != "" && selectedProvider == "" {
+		options := make([]string, 0)
+		for _, name := range registeredProviders() {
+			options = append(options, "--"+name)
+		}
+		log.Fatalf("--words requires an explicit provider flag: %s", strings.Join(options, ", "))
 	}
 	if *resume && (!*brute || *bench || *words != "" || *browse || *update) {
 		log.Fatal("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
@@ -127,7 +156,7 @@ func main() {
 		return
 	}
 
-	pool := newCheckPool(ctx, client, limiter, database, stats, *workers)
+	pool := newCheckPool(ctx, client, limiter, database, stats, provider, *workers)
 
 	seen := make(map[string]struct{})
 	emit := func(slug string) bool {
@@ -154,7 +183,7 @@ func main() {
 	pool.flush()
 	var runErr error
 	if *brute {
-		runErr = runBruteForce(ctx, pool, seen, database, minSlugLength, maxSlugLength, *resume)
+		runErr = runBruteForce(ctx, pool, seen, database, minSlugLength, maxSlugLength, *resume, "failed.txt")
 	}
 
 	pool.close()
@@ -262,59 +291,22 @@ func checkCompany(
 	slug string,
 	stats *benchmarkStats,
 ) error {
-	url := fmt.Sprintf(baseURL, slug)
-	backoff := 500 * time.Millisecond
+	return checkProviderCompany(ctx, client, limiter, database, providerGreenhouse, slug, stats)
+}
 
-	for attempt := 0; attempt < 4; attempt++ {
-		if err := limiter.Wait(ctx); err != nil {
-			return err
-		}
+func checkGreenhouseCompany(
+	ctx context.Context,
+	client *http.Client,
+	limiter *rate.Limiter,
+	database *db.DB,
+	slug string,
+	stats *benchmarkStats,
+) error {
+	return checkProviderCompany(ctx, client, limiter, database, providerGreenhouse, slug, stats)
+}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-		if err != nil {
-			return err
-		}
-
-		requestStarted := time.Now()
-		res, err := client.Do(req)
-		if err == nil {
-			io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
-			res.Body.Close()
-		}
-		if stats != nil {
-			status := 0
-			if res != nil {
-				status = res.StatusCode
-			}
-			stats.recordRequest(time.Since(requestStarted), status, err != nil, attempt > 0)
-		}
-		if err == nil {
-			switch {
-			case res.StatusCode == http.StatusOK || res.StatusCode == http.StatusNoContent:
-				if database != nil {
-					if err := database.AddCompany(ctx, slug); err != nil {
-						return fmt.Errorf("saving company: %w", err)
-					}
-					log.Printf("Found company: %s", slug)
-				}
-				return nil
-			case res.StatusCode == http.StatusNotFound:
-				return nil
-			case res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500:
-				// fall through to backoff and retry
-			default:
-				return fmt.Errorf("unexpected status %d", res.StatusCode)
-			}
-		}
-
-		select {
-		case <-time.After(backoff):
-			backoff *= 2
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return fmt.Errorf("gave up after retries")
+func logFoundCompany(provider, slug string) {
+	log.Printf("Found %s company: %s", provider, slug)
 }
 
 var benchmarkLatencyBuckets = []time.Duration{

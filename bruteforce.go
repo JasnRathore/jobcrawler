@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -13,9 +14,10 @@ import (
 )
 
 const (
-	checkQueueSize       = 1024
-	bruteCheckpointBatch = int64(10000)
-	progressInterval     = 5 * time.Second
+	checkQueueSize        = 1024
+	bruteCheckpointBatch  = int64(10000)
+	maxCheckpointFailures = 5
+	progressInterval      = 5 * time.Second
 )
 
 type checkResult struct {
@@ -34,9 +36,11 @@ type checkPool struct {
 	limiter  *rate.Limiter
 	database *db.DB
 	stats    *benchmarkStats
+	provider string
+	failures []checkResult
 }
 
-func newCheckPool(ctx context.Context, client *http.Client, limiter *rate.Limiter, database *db.DB, stats *benchmarkStats, workers int) *checkPool {
+func newCheckPool(ctx context.Context, client *http.Client, limiter *rate.Limiter, database *db.DB, stats *benchmarkStats, provider string, workers int) *checkPool {
 	pool := &checkPool{
 		jobs:     make(chan string, checkQueueSize),
 		results:  make(chan checkResult, workers),
@@ -45,13 +49,14 @@ func newCheckPool(ctx context.Context, client *http.Client, limiter *rate.Limite
 		limiter:  limiter,
 		database: database,
 		stats:    stats,
+		provider: provider,
 	}
 	for i := 0; i < workers; i++ {
 		pool.wg.Add(1)
 		go func() {
 			defer pool.wg.Done()
 			for slug := range pool.jobs {
-				err := checkCompany(pool.ctx, pool.client, pool.limiter, pool.database, slug, pool.stats)
+				err := checkProviderCompany(pool.ctx, pool.client, pool.limiter, pool.database, pool.provider, slug, pool.stats)
 				if pool.stats != nil {
 					pool.stats.recordCheck(err != nil)
 				}
@@ -83,9 +88,16 @@ func (p *checkPool) flush() int {
 		if result.err != nil {
 			failures++
 			log.Printf("%s: %v", result.slug, result.err)
+			p.failures = append(p.failures, result)
 		}
 	}
 	p.pending = 0
+	return failures
+}
+
+func (p *checkPool) takeFailures() []checkResult {
+	failures := p.failures
+	p.failures = nil
 	return failures
 }
 
@@ -103,12 +115,13 @@ func runBruteForce(
 	database *db.DB,
 	minLength, maxLength int,
 	resume bool,
+	failedPath string,
 ) error {
 	total := bruteCount(minLength, maxLength)
 	next := int64(0)
 	if resume {
 		var err error
-		next, err = database.StartBruteCheckpoint(ctx, minLength, maxLength, alphabet, total)
+		next, err = database.StartProviderBruteCheckpoint(ctx, pool.provider, minLength, maxLength, alphabet, total)
 		if err != nil {
 			return err
 		}
@@ -123,7 +136,6 @@ func runBruteForce(
 	lastProgress := started
 	lastSaved := next
 	var processed int64
-	var pendingFailures int
 	for next < total && ctx.Err() == nil {
 		batchEnd := next + bruteCheckpointBatch
 		if batchEnd > total {
@@ -137,26 +149,31 @@ func runBruteForce(
 					continue
 				}
 			}
-			failures, submitted := pool.submit(slug)
-			pendingFailures += failures
+			_, submitted := pool.submit(slug)
 			if !submitted {
 				break
 			}
 		}
-		pendingFailures += pool.flush()
+		pool.flush()
+		failed := pool.takeFailures()
+		if len(failed) > 0 {
+			if err := appendFailedCandidates(failedPath, failed); err != nil {
+				return err
+			}
+		}
 		if ctx.Err() != nil {
 			break
 		}
-		if resume && pendingFailures > 0 {
-			return fmt.Errorf("%d checks failed in candidates %d-%d; checkpoint remains at %d, rerun with --resume",
-				pendingFailures, batchStart, batchEnd-1, lastSaved)
+		if resume && len(failed) > maxCheckpointFailures {
+			return fmt.Errorf("%d checks failed in candidates %d-%d; checkpoint remains at %d and failures were saved to %s",
+				len(failed), batchStart, batchEnd-1, lastSaved, failedPath)
 		}
 
 		next = batchEnd
 		processed += batchEnd - batchStart
 		if resume {
 			saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := database.SaveBruteCheckpoint(saveCtx, minLength, maxLength, alphabet, next, total)
+			err := database.SaveProviderBruteCheckpoint(saveCtx, pool.provider, minLength, maxLength, alphabet, next, total)
 			cancel()
 			if err != nil {
 				return err
@@ -185,6 +202,23 @@ func runBruteForce(
 		} else {
 			log.Printf("Interrupted at candidate %d of %d; rerun with --brute --resume to enable checkpoints", next, total)
 		}
+	}
+	return nil
+}
+
+func appendFailedCandidates(path string, failures []checkResult) error {
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open failed-candidates file %q: %w", path, err)
+	}
+	for _, failure := range failures {
+		if _, err := fmt.Fprintln(file, failure.slug); err != nil {
+			file.Close()
+			return fmt.Errorf("write failed candidate %q to %q: %w", failure.slug, path, err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close failed-candidates file %q: %w", path, err)
 	}
 	return nil
 }

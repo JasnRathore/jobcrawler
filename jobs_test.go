@@ -19,6 +19,61 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+type fixtureProvider struct {
+	name string
+	job  db.Job
+}
+
+func (p fixtureProvider) Name() string                   { return p.name }
+func (fixtureProvider) CompanyEndpoints(string) []string { return nil }
+func (fixtureProvider) FallbackOnNotFound() bool         { return false }
+func (fixtureProvider) CheckCompany(context.Context, *http.Client, *rate.Limiter, string, *benchmarkStats) (bool, error) {
+	return true, nil
+}
+func (p fixtureProvider) FetchJobs(context.Context, *http.Client, *rate.Limiter, string) ([]db.Job, error) {
+	return []db.Job{p.job}, nil
+}
+
+func TestUpdateAllJobsIncludesEveryRegisteredProvider(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "all-providers.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	const fixtureName = "fixtureboard"
+	const secondFixtureName = "secondfixture"
+	registerProvider(fixtureProvider{name: fixtureName, job: db.Job{JobKey: "fixture-1", Title: "Fixture role"}})
+	defer delete(providerRegistry, fixtureName)
+	registerProvider(fixtureProvider{name: secondFixtureName, job: db.Job{JobKey: "fixture-2", Title: "Another fixture role"}})
+	defer delete(providerRegistry, secondFixtureName)
+
+	if err := database.AddCompanyForProvider(ctx, fixtureName, "fixtureco"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.AddCompanyForProvider(ctx, secondFixtureName, "anotherco"); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAllJobs(ctx, database, &http.Client{}, rate.NewLimiter(rate.Inf, 1), 2); err != nil {
+		t.Fatal(err)
+	}
+	jobs, total, err := database.ListJobs(ctx, db.JobFilters{}, false, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(jobs) != 2 {
+		t.Fatalf("all-provider update indexed %d jobs: %+v", total, jobs)
+	}
+	foundProviders := make(map[string]bool)
+	for _, job := range jobs {
+		foundProviders[job.Provider] = true
+	}
+	if !foundProviders[fixtureName] || !foundProviders[secondFixtureName] {
+		t.Fatalf("provider registered through adapter was not updated: %+v", jobs)
+	}
+}
+
 func TestUpdateCompanyJobsReplacesStaleJobsOnlyAfterCompleteResponse(t *testing.T) {
 	ctx := context.Background()
 	database, err := db.New(ctx, filepath.Join(t.TempDir(), "jobs.db"))
@@ -52,7 +107,7 @@ func TestUpdateCompanyJobsReplacesStaleJobsOnlyAfterCompleteResponse(t *testing.
 	if count != 2 {
 		t.Fatalf("indexed %d jobs, want 2", count)
 	}
-	listed, total, err := database.ListJobs(ctx, "", false, false, 10, 0)
+	listed, total, err := database.ListJobs(ctx, db.JobFilters{}, false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +119,7 @@ func TestUpdateCompanyJobsReplacesStaleJobsOnlyAfterCompleteResponse(t *testing.
 		if job.LocationName == "" {
 			t.Fatalf("stored job lost its location: %+v", job)
 		}
-		if strings.Contains(job.RawJSON, `"metadata"`) {
+		if strings.Contains(job.AttributesJSON, `"metadata"`) {
 			hasMetadata = true
 		}
 	}
@@ -76,7 +131,7 @@ func TestUpdateCompanyJobsReplacesStaleJobsOnlyAfterCompleteResponse(t *testing.
 	if _, err := updateCompanyJobs(ctx, database, client, limiter, "mcecleanenergy"); err == nil {
 		t.Fatal("incomplete response unexpectedly replaced existing jobs")
 	}
-	_, total, err = database.ListJobs(ctx, "", false, false, 10, 0)
+	_, total, err = database.ListJobs(ctx, db.JobFilters{}, false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +144,7 @@ func TestUpdateCompanyJobsReplacesStaleJobsOnlyAfterCompleteResponse(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	listed, total, err = database.ListJobs(ctx, "Changed", false, false, 10, 0)
+	listed, total, err = database.ListJobs(ctx, db.JobFilters{Query: "Changed"}, false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,16 +161,16 @@ func TestListJobsSearchesTitlesByDefault(t *testing.T) {
 	}
 	defer database.Close()
 
-	err = database.ReplaceCompanyJobs(ctx, "example", []db.GreenhouseJob{
-		{ID: 1, Title: "Summer Internship", Content: "Learn about our internal tools"},
-		{ID: 2, Title: "Senior Product Owner", Content: "Build internal systems"},
-		{ID: 3, Title: "Data Analyst", Content: "Join our intern program"},
+	err = database.ReplaceCompanyJobs(ctx, "example", []db.Job{
+		{ID: 1, Title: "Summer Internship", Description: "Learn about our internal tools"},
+		{ID: 2, Title: "Senior Product Owner", Description: "Build internal systems"},
+		{ID: 3, Title: "Data Analyst", Description: "Join our intern program"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	titles, total, err := database.ListJobs(ctx, "intern", false, false, 10, 0)
+	titles, total, err := database.ListJobs(ctx, db.JobFilters{Query: "intern"}, false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +178,7 @@ func TestListJobsSearchesTitlesByDefault(t *testing.T) {
 		t.Fatalf("title-only search returned total=%d jobs=%v, want only internship", total, titles)
 	}
 
-	broad, total, err := database.ListJobs(ctx, "intern", true, false, 10, 0)
+	broad, total, err := database.ListJobs(ctx, db.JobFilters{Query: "intern", IncludeDescriptions: true}, false, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +191,51 @@ func TestListJobsSearchesTitlesByDefault(t *testing.T) {
 		}
 	}
 
+}
+
+func TestJobsBrowseAcrossProvidersAndApplyCommonFilters(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "combined.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if err := database.ReplaceProviderJobs(ctx, providerGreenhouse, "green", []db.Job{
+		{ID: 1, Title: "Research Engineer", CompanyName: "Green Example", LocationName: "Boston, MA",
+			FirstPublished: "2026-10-15", EmploymentType: "Full-time", WorkplaceType: "remote"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.ReplaceProviderJobs(ctx, providerLever, "leverco", []db.Job{
+		{JobKey: "lever-1", Title: "Research Engineer", CompanyName: "Lever Example",
+			LocationName: "Boston, MA", FirstPublished: "2026-10-15T00:00:00Z",
+			EmploymentType: "Full-time or part-time", WorkplaceType: "remote"},
+		{JobKey: "lever-2", Title: "Research Associate", CompanyName: "Lever Example",
+			LocationName: "New York", FirstPublished: "2026-09-01", EmploymentType: "Contract",
+			WorkplaceType: "onsite"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	filters := db.JobFilters{
+		Query: "Research", Location: "Boston", PostedAfter: "2026-10-14",
+		PostedBefore: "2026-10-15", EmploymentType: "full-time", WorkplaceType: "remote",
+	}
+	jobs, total, err := database.ListJobs(ctx, filters, false, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || len(jobs) != 2 {
+		t.Fatalf("filtered combined listing returned %d jobs: %+v", total, jobs)
+	}
+	providers := map[string]bool{}
+	for _, job := range jobs {
+		providers[job.Provider] = true
+	}
+	if !providers[providerGreenhouse] || !providers[providerLever] {
+		t.Fatalf("combined results missing provider listings: %v", providers)
+	}
 }
 
 func TestCheckCompanyTreatsNoContentAsFound(t *testing.T) {
@@ -175,8 +275,8 @@ func TestBookmarksPersistWhenJobsAreRemoved(t *testing.T) {
 
 	defer database.Close()
 
-	if err := database.ReplaceCompanyJobs(ctx, "example", []db.GreenhouseJob{
-		{ID: 42, Title: "Research Intern", CompanyName: "Example", LocationName: "Remote", AbsoluteURL: "https://example.test/jobs/42"},
+	if err := database.ReplaceCompanyJobs(ctx, "example", []db.Job{
+		{ID: 42, Title: "Research Intern", CompanyName: "Example", LocationName: "Remote", DetailsURL: "https://example.test/jobs/42"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,12 +289,12 @@ func TestBookmarksPersistWhenJobsAreRemoved(t *testing.T) {
 		t.Fatalf("bookmark count=%d err=%v, want 1", count, err)
 	}
 
-	if err := database.ReplaceCompanyJobs(ctx, "example", []db.GreenhouseJob{
-		{ID: 42, Title: "Research Intern - Updated", CompanyName: "Example", LocationName: "Hybrid", AbsoluteURL: "https://example.test/jobs/42"},
+	if err := database.ReplaceCompanyJobs(ctx, "example", []db.Job{
+		{ID: 42, Title: "Research Intern - Updated", CompanyName: "Example", LocationName: "Hybrid", DetailsURL: "https://example.test/jobs/42"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	jobs, total, err := database.ListJobs(ctx, "", false, true, 10, 0)
+	jobs, total, err := database.ListJobs(ctx, db.JobFilters{}, true, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,11 +305,11 @@ func TestBookmarksPersistWhenJobsAreRemoved(t *testing.T) {
 	if err := database.ReplaceCompanyJobs(ctx, "example", nil); err != nil {
 		t.Fatal(err)
 	}
-	jobs, total, err = database.ListJobs(ctx, "intern", false, true, 10, 0)
+	jobs, total, err = database.ListJobs(ctx, db.JobFilters{Query: "intern"}, true, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 1 || len(jobs) != 1 || jobs[0].ID != 42 || !jobs[0].IsBookmarked {
+	if total != 1 || len(jobs) != 1 || jobs[0].ID != 42 || !jobs[0].IsBookmarked || jobs[0].IsAvailable {
 		t.Fatalf("saved jobs after refresh = total %d, jobs %+v; want saved snapshot", total, jobs)
 	}
 	removed, err := database.ToggleBookmark(ctx, "example", 42)
@@ -223,11 +323,14 @@ func TestBookmarksPersistWhenJobsAreRemoved(t *testing.T) {
 }
 
 func TestBookmarkButtonTemplateReflectsSavedState(t *testing.T) {
-	job := db.GreenhouseJob{
+	job := db.Job{
+		Provider:     providerGreenhouse,
 		CompanySlug:  "example",
 		ID:           42,
+		JobKey:       "42",
 		Title:        "Research Intern",
 		IsBookmarked: true,
+		IsAvailable:  true,
 	}
 	var rendered bytes.Buffer
 	err := browseResultsTemplate.Execute(&rendered, browsePage{
@@ -235,7 +338,7 @@ func TestBookmarkButtonTemplateReflectsSavedState(t *testing.T) {
 		Page:       1,
 		TotalPages: 1,
 		Total:      1,
-		Jobs:       []db.GreenhouseJob{job},
+		Jobs:       []db.Job{job},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -243,7 +346,7 @@ func TestBookmarkButtonTemplateReflectsSavedState(t *testing.T) {
 	html := rendered.String()
 	for _, expected := range []string{
 		"♥ Saved",
-		"hx-post=\"/bookmarks/toggle?company=example&amp;id=42&amp;saved=true\"",
+		"hx-post=\"/bookmarks/toggle?provider=greenhouse&amp;company=example&amp;id=42&amp;saved=true\"",
 		"hx-target=\"closest .job\"",
 	} {
 		if !strings.Contains(html, expected) {

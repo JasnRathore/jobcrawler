@@ -29,6 +29,11 @@ const (
 
 var htmlTagPattern = regexp.MustCompile(`<[^>]*>`)
 
+type companyTarget struct {
+	provider string
+	slug     string
+}
+
 type greenhouseResponse struct {
 	Jobs json.RawMessage `json:"jobs"`
 	Meta struct {
@@ -46,6 +51,11 @@ type greenhouseJobPayload struct {
 	RequisitionID       string          `json:"requisition_id"`
 	Title               string          `json:"title"`
 	CompanyName         string          `json:"company_name"`
+	Department          string          `json:"department"`
+	EmploymentType      string          `json:"employment_type"`
+	WorkplaceType       string          `json:"workplace_type"`
+	Education           string          `json:"education"`
+	Experience          string          `json:"experience"`
 	FirstPublished      string          `json:"first_published"`
 	Language            string          `json:"language"`
 	ApplicationDeadline string          `json:"application_deadline"`
@@ -60,38 +70,80 @@ func updateAllJobs(
 	limiter *rate.Limiter,
 	workers int,
 ) error {
-	companies, err := database.Companies(ctx)
+	targets := make([]companyTarget, 0)
+	for _, provider := range registeredProviders() {
+		companies, err := database.CompaniesForProvider(ctx, provider)
+		if err != nil {
+			return err
+		}
+		for _, slug := range companies {
+			targets = append(targets, companyTarget{provider: provider, slug: slug})
+		}
+	}
+	return updateJobTargets(ctx, database, targets, workers, func(ctx context.Context, target companyTarget) (int, error) {
+		return updateProviderCompanyJobs(ctx, database, client, limiter, target.provider, target.slug)
+	})
+}
+
+func updateJobTargets(
+	ctx context.Context,
+	database *db.DB,
+	targets []companyTarget,
+	workers int,
+	update func(context.Context, companyTarget) (int, error),
+) error {
+	completed, err := database.JobUpdateCheckpoints(ctx)
 	if err != nil {
 		return err
 	}
-	if len(companies) == 0 {
-		log.Printf("No companies to update; discover companies first")
-		return nil
+	completedSet := make(map[companyTarget]struct{}, len(completed))
+	for _, checkpoint := range completed {
+		completedSet[companyTarget{provider: checkpoint.Provider, slug: checkpoint.CompanySlug}] = struct{}{}
 	}
 
-	jobs := make(chan string)
-	errs := make(chan error, len(companies))
+	pending := make([]companyTarget, 0, len(targets))
+	for _, target := range targets {
+		if _, done := completedSet[target]; !done {
+			pending = append(pending, target)
+		}
+	}
+	if len(pending) == 0 {
+		if len(targets) == 0 {
+			log.Printf("No companies to update; discover companies first")
+		} else {
+			log.Printf("All %d company job updates were already checkpointed", len(targets))
+		}
+		return database.ClearJobUpdateCheckpoints(ctx)
+	}
+
+	jobs := make(chan companyTarget)
+	errs := make(chan error, len(pending))
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for slug := range jobs {
-				count, err := updateCompanyJobs(ctx, database, client, limiter, slug)
+			for target := range jobs {
+				count, err := update(ctx, target)
 				if err != nil {
-					log.Printf("%s: job update failed: %v", slug, err)
+					log.Printf("%s/%s: job update failed: %v", target.provider, target.slug, err)
 					errs <- err
 					continue
 				}
-				log.Printf("%s: indexed %d jobs", slug, count)
+				if err := database.SaveJobUpdateCheckpoint(ctx, target.provider, target.slug); err != nil {
+					log.Printf("%s/%s: could not save job update checkpoint: %v", target.provider, target.slug, err)
+					errs <- err
+					continue
+				}
+				log.Printf("%s/%s: indexed %d jobs", target.provider, target.slug, count)
 			}
 		}()
 	}
 
 sendCompanies:
-	for _, slug := range companies {
+	for _, target := range pending {
 		select {
-		case jobs <- slug:
+		case jobs <- target:
 		case <-ctx.Done():
 			break sendCompanies
 		}
@@ -112,9 +164,22 @@ sendCompanies:
 		return ctx.Err()
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d of %d company job updates failed: %w", failed, len(companies), firstErr)
+		return fmt.Errorf("%d of %d company job updates failed: %w", failed, len(pending), firstErr)
+	}
+	if err := database.ClearJobUpdateCheckpoints(ctx); err != nil {
+		return err
 	}
 	return nil
+}
+
+func updateProviderCompanyJobs(
+	ctx context.Context,
+	database *db.DB,
+	client *http.Client,
+	limiter *rate.Limiter,
+	provider, slug string,
+) (int, error) {
+	return updateProviderJobs(ctx, database, client, limiter, provider, slug)
 }
 
 func updateCompanyJobs(
@@ -124,17 +189,33 @@ func updateCompanyJobs(
 	limiter *rate.Limiter,
 	slug string,
 ) (int, error) {
+	parsedJobs, err := fetchGreenhouseJobs(ctx, client, limiter, slug)
+	if err != nil {
+		return 0, err
+	}
+	if err := database.ReplaceCompanyJobs(ctx, slug, parsedJobs); err != nil {
+		return 0, err
+	}
+	return len(parsedJobs), nil
+}
+
+func fetchGreenhouseJobs(
+	ctx context.Context,
+	client *http.Client,
+	limiter *rate.Limiter,
+	slug string,
+) ([]db.Job, error) {
 	requestURL := fmt.Sprintf(jobListURL, url.PathEscape(slug))
 	backoff := 500 * time.Millisecond
 	var response *greenhouseResponse
 
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := limiter.Wait(ctx); err != nil {
-			return 0, err
+			return nil, err
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 		if err != nil {
-			return 0, fmt.Errorf("create jobs request: %w", err)
+			return nil, fmt.Errorf("create jobs request: %w", err)
 		}
 		req.Header.Set("Accept", "application/json")
 		res, err := client.Do(req)
@@ -147,7 +228,7 @@ func updateCompanyJobs(
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
 			} else if res.StatusCode != http.StatusOK {
 				res.Body.Close()
-				return 0, fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
+				return nil, fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
 			} else {
 				var parsed greenhouseResponse
 				decoder := json.NewDecoder(io.LimitReader(res.Body, maxJobsBody))
@@ -164,10 +245,10 @@ func updateCompanyJobs(
 				}
 				closeErr := res.Body.Close()
 				if decodeErr != nil {
-					return 0, fmt.Errorf("decode jobs response: %w", decodeErr)
+					return nil, fmt.Errorf("decode jobs response: %w", decodeErr)
 				}
 				if closeErr != nil {
-					return 0, fmt.Errorf("close jobs response: %w", closeErr)
+					return nil, fmt.Errorf("close jobs response: %w", closeErr)
 				}
 				response = &parsed
 				break
@@ -175,75 +256,78 @@ func updateCompanyJobs(
 		}
 
 		if attempt == 3 {
-			return 0, fmt.Errorf("fetch jobs after retries: %w", err)
+			return nil, fmt.Errorf("fetch jobs after retries: %w", err)
 		}
 		select {
 		case <-time.After(backoff):
 			backoff *= 2
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 
 	if response == nil {
-		return 0, errors.New("jobs request completed without a response")
+		return nil, errors.New("jobs request completed without a response")
 	}
 	if len(response.Jobs) == 0 || !strings.HasPrefix(strings.TrimSpace(string(response.Jobs)), "[") {
-		return 0, errors.New("jobs response did not contain a jobs array; existing jobs were kept")
+		return nil, errors.New("jobs response did not contain a jobs array; existing jobs were kept")
 	}
 	var responseJobs []json.RawMessage
 	if err := json.Unmarshal(response.Jobs, &responseJobs); err != nil {
-		return 0, fmt.Errorf("decode jobs array: %w", err)
+		return nil, fmt.Errorf("decode jobs array: %w", err)
 	}
 	if response.Meta.Total == nil || *response.Meta.Total < 0 {
-		return 0, errors.New("jobs response did not contain a valid meta.total; existing jobs were kept")
+		return nil, errors.New("jobs response did not contain a valid meta.total; existing jobs were kept")
 	}
 	if *response.Meta.Total != len(responseJobs) {
-		return 0, fmt.Errorf("incomplete jobs response: meta.total=%d but received %d; existing jobs were kept",
+		return nil, fmt.Errorf("incomplete jobs response: meta.total=%d but received %d; existing jobs were kept",
 			*response.Meta.Total, len(responseJobs))
 	}
 
-	parsedJobs := make([]db.GreenhouseJob, 0, len(responseJobs))
+	parsedJobs := make([]db.Job, 0, len(responseJobs))
 	for _, raw := range responseJobs {
 		var payload greenhouseJobPayload
 		if err := json.Unmarshal(raw, &payload); err != nil {
-			return 0, fmt.Errorf("decode job: %w", err)
+			return nil, fmt.Errorf("decode job: %w", err)
 		}
 		if payload.ID <= 0 {
-			return 0, errors.New("job response contains an invalid id; existing jobs were kept")
+			return nil, errors.New("job response contains an invalid id; existing jobs were kept")
 		}
 		var location struct {
 			Name string `json:"name"`
 		}
 		if len(payload.Location) > 0 && string(payload.Location) != "null" {
 			if err := json.Unmarshal(payload.Location, &location); err != nil {
-				return 0, fmt.Errorf("decode location for job %d: %w", payload.ID, err)
+				return nil, fmt.Errorf("decode location for job %d: %w", payload.ID, err)
 			}
 		}
-		parsedJobs = append(parsedJobs, db.GreenhouseJob{
-			ID:                  payload.ID,
-			InternalJobID:       payload.InternalJobID,
-			Title:               payload.Title,
-			CompanyName:         payload.CompanyName,
-			LocationName:        location.Name,
-			LocationJSON:        jsonOrNull(payload.Location),
-			AbsoluteURL:         payload.AbsoluteURL,
-			UpdatedAt:           payload.UpdatedAt,
-			FirstPublished:      payload.FirstPublished,
-			RequisitionID:       payload.RequisitionID,
-			Language:            payload.Language,
-			ApplicationDeadline: payload.ApplicationDeadline,
-			Metadata:            jsonOrNull(payload.Metadata),
-			DataCompliance:      jsonOrNull(payload.DataCompliance),
-			Content:             payload.Content,
-			RawJSON:             string(raw),
+		attributes, err := json.Marshal(map[string]any{
+			"metadata": payload.Metadata, "data_compliance": payload.DataCompliance,
+			"requisition_id": payload.RequisitionID, "language": payload.Language,
+			"application_deadline": payload.ApplicationDeadline, "internal_job_id": payload.InternalJobID,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("normalize attributes for job %d: %w", payload.ID, err)
+		}
+		parsedJobs = append(parsedJobs, db.Job{
+			ID:             payload.ID,
+			Title:          payload.Title,
+			CompanyName:    payload.CompanyName,
+			LocationName:   location.Name,
+			LocationJSON:   jsonOrNull(payload.Location),
+			DetailsURL:     payload.AbsoluteURL,
+			UpdatedAt:      payload.UpdatedAt,
+			FirstPublished: payload.FirstPublished,
+			EmploymentType: payload.EmploymentType,
+			WorkplaceType:  normalizeWorkplaceType(payload.WorkplaceType),
+			Department:     payload.Department,
+			Education:      payload.Education,
+			Experience:     payload.Experience,
+			Description:    plainText(payload.Content),
+			AttributesJSON: string(attributes),
 		})
 	}
-
-	if err := database.ReplaceCompanyJobs(ctx, slug, parsedJobs); err != nil {
-		return 0, err
-	}
-	return len(parsedJobs), nil
+	return parsedJobs, nil
 }
 
 func jsonOrNull(raw json.RawMessage) string {
@@ -262,17 +346,29 @@ func plainText(content string) string {
 
 type browsePage struct {
 	Query               string
+	Location            string
+	PostedAfter         string
+	PostedBefore        string
+	EmploymentType      string
+	WorkplaceType       string
 	IncludeDescriptions bool
 	SavedOnly           bool
 	Page                int
 	TotalPages          int
 	Total               int
-	Jobs                []db.GreenhouseJob
+	Jobs                []db.Job
 }
 
 type browseHome struct {
-	SavedOnly     bool
-	BookmarkCount int
+	SavedOnly           bool
+	BookmarkCount       int
+	Query               string
+	Location            string
+	PostedAfter         string
+	PostedBefore        string
+	EmploymentType      string
+	WorkplaceType       string
+	IncludeDescriptions bool
 }
 
 var browsePageTemplate = template.Must(template.New("browse").Parse(`<!doctype html>
@@ -280,7 +376,7 @@ var browsePageTemplate = template.Must(template.New("browse").Parse(`<!doctype h
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<title>Greenhouse Jobs</title>
+	<title>Job Browser</title>
 	<script src="https://unpkg.com/htmx.org@2.0.4"></script>
 	<style>
 		:root { color-scheme: light; --ink: #172033; --muted: #64748b; --line: #e2e8f0; --accent: #2457d6; --surface: #fff; --canvas: #f5f7fb; }
@@ -300,6 +396,9 @@ var browsePageTemplate = template.Must(template.New("browse").Parse(`<!doctype h
 		.count { min-width: 1.5rem; padding: .05rem .4rem; border-radius: 1rem; background: #e2e8f0; color: #475569; text-align: center; font-size: .8rem; }
 		.search-label { display: block; margin-bottom: .45rem; font-weight: 650; }
 		.search-row { display: flex; gap: .6rem; }
+		.filter-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .7rem; margin-top: .9rem; }
+		.filter-row label { display: grid; gap: .3rem; color: #475569; font-size: .88rem; font-weight: 600; }
+		.filter-row input, .filter-row select { width: 100%; padding: .65rem; border: 1px solid #cbd5e1; border-radius: 8px; background: white; color: var(--ink); font: inherit; }
 		input[type=search] { min-width: 0; flex: 1; padding: .8rem .9rem; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
 		input[type=search]:focus { outline: 3px solid #2457d633; border-color: var(--accent); }
 		button, .button { display: inline-flex; align-items: center; justify-content: center; gap: .35rem; padding: .65rem .95rem; border: 1px solid var(--line); border-radius: 8px; background: white; color: var(--ink); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
@@ -318,13 +417,14 @@ var browsePageTemplate = template.Must(template.New("browse").Parse(`<!doctype h
 		.job h2 a:hover { color: var(--accent); text-decoration: underline; }
 		.job-meta { display: flex; flex-wrap: wrap; gap: .35rem .8rem; margin: .7rem 0 0; color: var(--muted); font-size: .9rem; }
 		.job-meta span + span:before { content: "·"; margin-right: .8rem; color: #94a3b8; }
+		.unavailable { color: #b91c1c; font-weight: 650; }
 		.job-actions { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-top: 1rem; }
 		.bookmark-toggle { min-width: 7rem; }
 		.bookmark-toggle[aria-label="Remove bookmark"] { color: #be123c; border-color: #fecdd3; background: #fff1f2; }
 		details { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: .8rem; }
 		summary { color: #334155; font-weight: 600; cursor: pointer; }
 		.description { max-height: 22rem; overflow: auto; margin: .7rem 0 0; color: #334155; white-space: pre-wrap; overflow-wrap: anywhere; font: .9rem/1.6 system-ui, sans-serif; }
-		.raw-json { max-height: 22rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
+		.job-attributes { max-height: 22rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
 		nav { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; }
 		.empty { padding: 3rem 1rem; text-align: center; color: var(--muted); background: white; border: 1px dashed #cbd5e1; border-radius: 12px; }
 		.htmx-indicator { display: none; color: var(--muted); }
@@ -334,12 +434,12 @@ var browsePageTemplate = template.Must(template.New("browse").Parse(`<!doctype h
 </head>
 <body>
 	<header><div class="header-inner">
-		<h1>Greenhouse Jobs</h1>
-		<p>Explore open roles indexed from company career boards.</p>
+		<h1>Browse jobs</h1>
+		<p>Explore indexed openings across all supported job boards.</p>
 	</div></header>
 	<main>
 		<nav class="tabs" aria-label="Job lists">
-			<a class="tab {{if not .SavedOnly}}active{{end}}" href="/">All jobs</a>
+			<a class="tab {{if not .SavedOnly}}active{{end}}" href="/?saved=false">All jobs</a>
 			<a class="tab {{if .SavedOnly}}active{{end}}" href="/?saved=true">Saved <span id="bookmark-count" class="count"
 				hx-get="/bookmarks/count" hx-trigger="load, bookmarksChanged from:body" hx-swap="innerHTML">{{.BookmarkCount}}</span></a>
 		</nav>
@@ -349,14 +449,36 @@ var browsePageTemplate = template.Must(template.New("browse").Parse(`<!doctype h
 			<input type="hidden" name="saved" value="{{.SavedOnly}}">
 			<label class="search-label" for="job-search">Find a role</label>
 			<div class="search-row">
-				<input id="job-search" type="search" name="q" placeholder="Try “intern”, “designer”, or “data analyst”"
+				<input id="job-search" type="search" name="q" value="{{.Query}}" placeholder="Try “intern”, “designer”, or “data analyst”"
 					autocomplete="off">
 				<button class="primary" type="submit">Search</button>
 			</div>
+			<div class="filter-row">
+				<label>Location <input name="location" value="{{.Location}}" placeholder="City, state, or country"></label>
+				<label>Posted after <input type="date" name="posted_after" value="{{.PostedAfter}}"></label>
+				<label>Posted before <input type="date" name="posted_before" value="{{.PostedBefore}}"></label>
+				<label>Employment
+					<select name="employment">
+						<option value="">Any type</option>
+						<option value="full-time" {{if eq .EmploymentType "full-time"}}selected{{end}}>Full-time</option>
+						<option value="part-time" {{if eq .EmploymentType "part-time"}}selected{{end}}>Part-time</option>
+						<option value="contract" {{if eq .EmploymentType "contract"}}selected{{end}}>Contract</option>
+						<option value="internship" {{if eq .EmploymentType "internship"}}selected{{end}}>Internship</option>
+					</select>
+				</label>
+				<label>Workplace
+					<select name="workplace">
+						<option value="">Any workplace</option>
+						<option value="remote" {{if eq .WorkplaceType "remote"}}selected{{end}}>Remote</option>
+						<option value="hybrid" {{if eq .WorkplaceType "hybrid"}}selected{{end}}>Hybrid</option>
+						<option value="onsite" {{if eq .WorkplaceType "onsite"}}selected{{end}}>On-site</option>
+					</select>
+				</label>
+			</div>
 			<div class="search-options">
-				<label class="check-option"><input id="include-descriptions" type="checkbox" name="details" value="true">
-					Include company, location, and description text</label>
-				<span class="search-help">By default, matching is limited to job titles.</span>
+				<label class="check-option"><input id="include-descriptions" type="checkbox" name="details" value="true" {{if .IncludeDescriptions}}checked{{end}}>
+					Also search job descriptions</label>
+				<span class="search-help">Search matches title, company, and location by default.</span>
 			</div>
 		</form>
 		<div id="results" hx-get="/jobs" hx-include="#search-form"
@@ -372,13 +494,15 @@ var browseResultsTemplate = template.Must(template.New("results").Funcs(template
 	"subtract": func(a, b int) int { return a - b },
 	"urlquery": url.QueryEscape,
 	"date": func(value string) string {
-		parsed, err := time.Parse(time.RFC3339, value)
-		if err != nil {
-			return value
+		for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+			parsed, err := time.Parse(layout, value)
+			if err == nil {
+				return parsed.Format("Jan 2, 2006")
+			}
 		}
-		return parsed.Format("Jan 2, 2006")
+		return value
 	},
-	"bookmarkButton": func(companySlug string, jobID int64, isBookmarked, savedOnly bool) template.HTML {
+	"bookmarkButton": func(provider, companySlug, jobKey string, isBookmarked, savedOnly bool) template.HTML {
 		var label, action string
 		if isBookmarked {
 			label, action = "♥ Saved", "Remove bookmark"
@@ -391,10 +515,10 @@ var browseResultsTemplate = template.Must(template.New("results").Funcs(template
 		}
 		return template.HTML(fmt.Sprintf(
 			`<button class="bookmark-toggle" type="button" aria-label="%s" title="%s"
-				hx-post="/bookmarks/toggle?company=%s&amp;id=%d&amp;saved=%s"
+				hx-post="/bookmarks/toggle?provider=%s&amp;company=%s&amp;id=%s&amp;saved=%s"
 				hx-target="%s" hx-swap="%s">%s</button>`,
 			template.HTMLEscapeString(action), template.HTMLEscapeString(action),
-			url.QueryEscape(companySlug), jobID, savedQuery, target, swap,
+			url.QueryEscape(provider), url.QueryEscape(companySlug), url.QueryEscape(jobKey), savedQuery, target, swap,
 			template.HTMLEscapeString(label),
 		))
 	},
@@ -406,25 +530,34 @@ var browseResultsTemplate = template.Must(template.New("results").Funcs(template
 	{{range .Jobs}}
 	<article class="job">
 		<div class="job-top">
-			<h2><a href="{{.AbsoluteURL}}" target="_blank" rel="noopener noreferrer">{{if .Title}}{{.Title}}{{else}}Untitled job{{end}}</a></h2>
+			<h2>{{if .DetailsURL}}<a href="{{.DetailsURL}}" target="_blank" rel="noopener noreferrer">{{end}}{{if .Title}}{{.Title}}{{else}}Untitled job{{end}}{{if .DetailsURL}}</a>{{end}}</h2>
 			<div class="job-actions">
-				{{bookmarkButton .CompanySlug .ID .IsBookmarked $.SavedOnly}}
-				<a class="button primary" href="{{.AbsoluteURL}}" target="_blank" rel="noopener noreferrer">View job ↗</a>
+				{{bookmarkButton .Provider .CompanySlug .JobKey .IsBookmarked $.SavedOnly}}
+				{{if .DetailsURL}}<a class="button primary" href="{{.DetailsURL}}" target="_blank" rel="noopener noreferrer">View job details ↗</a>{{end}}
 			</div>
 		</div>
 		<div class="job-meta">
 			<span>{{if .CompanyName}}{{.CompanyName}}{{else}}{{.CompanySlug}}{{end}}</span>
 			{{if .LocationName}}<span>{{.LocationName}}</span>{{end}}
 			{{if .FirstPublished}}<span>Posted {{date .FirstPublished}}</span>{{end}}
-			{{if .RequisitionID}}<span>Req {{.RequisitionID}}</span>{{end}}
-		</div>
-		{{if .Content}}<details><summary>Preview job description</summary><div class="description">{{.Content}}</div></details>{{end}}
-		<details><summary>Job data</summary><pre class="raw-json">{{.RawJSON}}</pre></details>
-	</article>
-	{{end}}
-	<nav>
-		{{if gt .Page 1}}<a class="button" href="/jobs?q={{urlquery .Query}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{subtract .Page 1}}" hx-get="/jobs?q={{urlquery .Query}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{subtract .Page 1}}" hx-target="#results" hx-swap="innerHTML" hx-push-url="true">← Previous</a>{{else}}<span></span>{{end}}
-		{{if lt .Page .TotalPages}}<a class="button" href="/jobs?q={{urlquery .Query}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{add .Page 1}}" hx-get="/jobs?q={{urlquery .Query}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{add .Page 1}}" hx-target="#results" hx-swap="innerHTML" hx-push-url="true">Next →</a>{{end}}
+				{{if .EmploymentType}}<span>{{.EmploymentType}}</span>{{end}}
+				{{if .WorkplaceType}}<span>{{.WorkplaceType}}</span>{{end}}
+				{{if not .IsAvailable}}<span class="unavailable">No longer listed</span>{{end}}
+			</div>
+			{{if .Description}}<details><summary>Preview job description</summary><div class="description">{{.Description}}</div></details>{{end}}
+			<details><summary>Listing details</summary>
+				<p>Source: {{.Provider}} / {{.CompanySlug}}</p>
+				{{if .ApplyURL}}<p><a href="{{.ApplyURL}}" target="_blank" rel="noopener noreferrer">Apply for this job ↗</a></p>{{end}}
+				{{if .Department}}<p>Department: {{.Department}}</p>{{end}}
+				{{if .Education}}<p>Education: {{.Education}}</p>{{end}}
+				{{if .Experience}}<p>Experience: {{.Experience}}</p>{{end}}
+				{{if .AttributesJSON}}				<pre class="job-attributes">{{.AttributesJSON}}</pre>{{end}}
+			</details>
+		</article>
+		{{end}}
+		<nav>
+			{{if gt .Page 1}}<a class="button" href="/jobs?q={{urlquery .Query}}&amp;location={{urlquery .Location}}&amp;posted_after={{.PostedAfter}}&amp;posted_before={{.PostedBefore}}&amp;employment={{urlquery .EmploymentType}}&amp;workplace={{urlquery .WorkplaceType}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{subtract .Page 1}}" hx-get="/jobs?q={{urlquery .Query}}&amp;location={{urlquery .Location}}&amp;posted_after={{.PostedAfter}}&amp;posted_before={{.PostedBefore}}&amp;employment={{urlquery .EmploymentType}}&amp;workplace={{urlquery .WorkplaceType}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{subtract .Page 1}}" hx-target="#results" hx-swap="innerHTML" hx-push-url="true">← Previous</a>{{else}}<span></span>{{end}}
+			{{if lt .Page .TotalPages}}<a class="button" href="/jobs?q={{urlquery .Query}}&amp;location={{urlquery .Location}}&amp;posted_after={{.PostedAfter}}&amp;posted_before={{.PostedBefore}}&amp;employment={{urlquery .EmploymentType}}&amp;workplace={{urlquery .WorkplaceType}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{add .Page 1}}" hx-get="/jobs?q={{urlquery .Query}}&amp;location={{urlquery .Location}}&amp;posted_after={{.PostedAfter}}&amp;posted_before={{.PostedBefore}}&amp;employment={{urlquery .EmploymentType}}&amp;workplace={{urlquery .WorkplaceType}}&amp;details={{.IncludeDescriptions}}&amp;saved={{.SavedOnly}}&amp;page={{add .Page 1}}" hx-target="#results" hx-swap="innerHTML" hx-push-url="true">Next →</a>{{end}}
 	</nav>
 {{else}}
 	<div class="empty"><strong>{{if .SavedOnly}}No saved jobs yet{{else}}No matching jobs{{end}}</strong><p>{{if .SavedOnly}}Save a job from the All jobs list and it will appear here.{{else}}Try a different title or enable description search for broader results.{{end}}</p></div>
@@ -445,8 +578,15 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 			return
 		}
 		if err := browsePageTemplate.Execute(w, browseHome{
-			SavedOnly:     r.URL.Query().Get("saved") == "true",
-			BookmarkCount: count,
+			SavedOnly:           r.URL.Query().Get("saved") == "true",
+			BookmarkCount:       count,
+			Query:               r.URL.Query().Get("q"),
+			Location:            r.URL.Query().Get("location"),
+			PostedAfter:         r.URL.Query().Get("posted_after"),
+			PostedBefore:        r.URL.Query().Get("posted_before"),
+			EmploymentType:      r.URL.Query().Get("employment"),
+			WorkplaceType:       r.URL.Query().Get("workplace"),
+			IncludeDescriptions: r.URL.Query().Get("details") == "true",
 		}); err != nil {
 			log.Printf("render browser page: %v", err)
 		}
@@ -455,6 +595,31 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 		query := strings.TrimSpace(r.URL.Query().Get("q"))
 		includeDescriptions := r.URL.Query().Get("details") == "true"
 		savedOnly := r.URL.Query().Get("saved") == "true"
+		filters := db.JobFilters{
+			Query: query, Location: strings.TrimSpace(r.URL.Query().Get("location")),
+			PostedAfter: r.URL.Query().Get("posted_after"), PostedBefore: r.URL.Query().Get("posted_before"),
+			EmploymentType:      strings.TrimSpace(r.URL.Query().Get("employment")),
+			WorkplaceType:       strings.TrimSpace(r.URL.Query().Get("workplace")),
+			IncludeDescriptions: includeDescriptions,
+		}
+		if r.Header.Get("HX-Request") != "true" {
+			count, err := database.BookmarkCount(r.Context())
+			if err != nil {
+				http.Error(w, "could not load bookmarks", http.StatusInternalServerError)
+				log.Printf("count bookmarks: %v", err)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			if err := browsePageTemplate.Execute(w, browseHome{
+				SavedOnly: savedOnly, BookmarkCount: count, Query: query,
+				Location: filters.Location, PostedAfter: filters.PostedAfter,
+				PostedBefore: filters.PostedBefore, EmploymentType: filters.EmploymentType,
+				WorkplaceType: filters.WorkplaceType, IncludeDescriptions: includeDescriptions,
+			}); err != nil {
+				log.Printf("render browser page: %v", err)
+			}
+			return
+		}
 		page, err := strconv.Atoi(r.URL.Query().Get("page"))
 		if err != nil || page < 1 {
 			page = 1
@@ -462,7 +627,7 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 		if page > 1_000_000 {
 			page = 1_000_000
 		}
-		jobs, total, err := database.ListJobs(r.Context(), query, includeDescriptions, savedOnly, jobPageSize, (page-1)*jobPageSize)
+		jobs, total, err := database.ListJobs(r.Context(), filters, savedOnly, jobPageSize, (page-1)*jobPageSize)
 		if err != nil {
 			http.Error(w, "could not load jobs", http.StatusInternalServerError)
 			log.Printf("load jobs: %v", err)
@@ -474,7 +639,7 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 		}
 		if page > totalPages {
 			page = totalPages
-			jobs, _, err = database.ListJobs(r.Context(), query, includeDescriptions, savedOnly, jobPageSize, (page-1)*jobPageSize)
+			jobs, _, err = database.ListJobs(r.Context(), filters, savedOnly, jobPageSize, (page-1)*jobPageSize)
 			if err != nil {
 				http.Error(w, "could not load jobs", http.StatusInternalServerError)
 				log.Printf("load jobs page: %v", err)
@@ -482,11 +647,13 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 			}
 		}
 		for i := range jobs {
-			jobs[i].Content = plainText(jobs[i].Content)
+			jobs[i].Description = plainText(jobs[i].Description)
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := browseResultsTemplate.Execute(w, browsePage{
-			Query: query, IncludeDescriptions: includeDescriptions, SavedOnly: savedOnly,
+			Query: query, Location: filters.Location, PostedAfter: filters.PostedAfter, PostedBefore: filters.PostedBefore,
+			EmploymentType: filters.EmploymentType, WorkplaceType: filters.WorkplaceType,
+			IncludeDescriptions: includeDescriptions, SavedOnly: savedOnly,
 			Page: page, TotalPages: totalPages, Total: total, Jobs: jobs,
 		}); err != nil {
 			log.Printf("render jobs: %v", err)
@@ -498,12 +665,13 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 			return
 		}
 		company := strings.TrimSpace(r.URL.Query().Get("company"))
-		jobID, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
-		if company == "" || err != nil || jobID <= 0 {
+		jobID := strings.TrimSpace(r.URL.Query().Get("id"))
+		provider := strings.TrimSpace(r.URL.Query().Get("provider"))
+		if company == "" || jobID == "" || !supportedProvider(provider) {
 			http.Error(w, "invalid bookmark request", http.StatusBadRequest)
 			return
 		}
-		saved, err := database.ToggleBookmark(r.Context(), company, jobID)
+		saved, err := database.ToggleProviderBookmark(r.Context(), provider, company, jobID)
 		if err != nil {
 			http.Error(w, "could not update bookmark", http.StatusInternalServerError)
 			log.Printf("toggle bookmark: %v", err)
@@ -519,15 +687,17 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 			action, label = "Remove bookmark", "♥ Saved"
 		}
 		target := "closest .bookmark-toggle"
+		savedQuery := "false"
 		if r.URL.Query().Get("saved") == "true" {
-			target = "closest .job"
+			target, savedQuery = "closest .job", "true"
 		}
 		if _, err := fmt.Fprintf(w, `<button class="bookmark-toggle" type="button" aria-label="%s" title="%s"
-			hx-post="/bookmarks/toggle?company=%s&amp;id=%d" hx-target="%s" hx-swap="outerHTML">%s</button>`,
+			hx-post="/bookmarks/toggle?provider=%s&amp;company=%s&amp;id=%s&amp;saved=%s" hx-target="%s" hx-swap="outerHTML">%s</button>`,
 			template.HTMLEscapeString(action), template.HTMLEscapeString(action),
-			url.QueryEscape(company), jobID, target, template.HTMLEscapeString(label)); err != nil {
+			url.QueryEscape(provider), url.QueryEscape(company), url.QueryEscape(jobID), savedQuery, target, template.HTMLEscapeString(label)); err != nil {
 			log.Printf("write bookmark response: %v", err)
 		}
+
 	})
 	mux.HandleFunc("/bookmarks/count", func(w http.ResponseWriter, r *http.Request) {
 		count, err := database.BookmarkCount(r.Context())
@@ -559,4 +729,17 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 		return nil
 	}
 	return err
+}
+
+func providerDisplayName(provider string) string {
+	switch provider {
+	case providerGreenhouse:
+		return "Greenhouse"
+	case providerLever:
+		return "Lever"
+	case providerWorkable:
+		return "Workable"
+	default:
+		return provider
+	}
 }
