@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"db"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -67,7 +66,7 @@ func updateAllJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	workers int,
 ) error {
 	targets := make([]companyTarget, 0)
@@ -176,7 +175,7 @@ func updateProviderCompanyJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	provider, slug string,
 ) (int, error) {
 	return updateProviderJobs(ctx, database, client, limiter, provider, slug)
@@ -186,7 +185,7 @@ func updateCompanyJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	slug string,
 ) (int, error) {
 	parsedJobs, err := fetchGreenhouseJobs(ctx, client, limiter, slug)
@@ -202,7 +201,7 @@ func updateCompanyJobs(
 func fetchGreenhouseJobs(
 	ctx context.Context,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	slug string,
 ) ([]db.Job, error) {
 	requestURL := fmt.Sprintf(jobListURL, url.PathEscape(slug))
@@ -223,7 +222,17 @@ func fetchGreenhouseJobs(
 			res.Body.Close()
 		}
 		if err == nil {
-			if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			if res.StatusCode == http.StatusTooManyRequests {
+				res.Body.Close()
+				cooldownStarted := limiter.StartCooldown("greenhouse") > 0
+				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
+				if cooldownStarted {
+					if attempt == 3 {
+						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
+					}
+					continue
+				}
+			} else if res.StatusCode >= 500 {
 				res.Body.Close()
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
 			} else if res.StatusCode != http.StatusOK {

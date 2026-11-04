@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"db"
@@ -21,12 +23,73 @@ const (
 	providerWorkable   = "workable"
 )
 
+type requestLimiter struct {
+	*rate.Limiter
+	cooldown time.Duration
+
+	mu            sync.Mutex
+	cooldownUntil time.Time
+}
+
+func newRequestLimiter(limiter *rate.Limiter, cooldown time.Duration) *requestLimiter {
+	return &requestLimiter{Limiter: limiter, cooldown: cooldown}
+}
+
+func (l *requestLimiter) Wait(ctx context.Context) error {
+	for {
+		l.mu.Lock()
+		wait := time.Until(l.cooldownUntil)
+		l.mu.Unlock()
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return ctx.Err()
+			}
+			continue
+		}
+
+		if err := l.Limiter.Wait(ctx); err != nil {
+			return err
+		}
+
+		l.mu.Lock()
+		coolingDown := time.Now().Before(l.cooldownUntil)
+		l.mu.Unlock()
+		if !coolingDown {
+			return nil
+		}
+	}
+}
+
+func (l *requestLimiter) StartCooldown(provider string) time.Duration {
+	if l.cooldown <= 0 {
+		return 0
+	}
+	until := time.Now().Add(l.cooldown)
+	l.mu.Lock()
+	if until.After(l.cooldownUntil) {
+		l.cooldownUntil = until
+	}
+	wait := time.Until(l.cooldownUntil)
+	l.mu.Unlock()
+	log.Printf("%s returned HTTP 429; pausing requests for %s", provider, wait.Round(time.Second))
+	return wait
+}
+
 type jobBoardProvider interface {
 	Name() string
 	CompanyEndpoints(string) []string
 	FallbackOnNotFound() bool
-	CheckCompany(context.Context, *http.Client, *rate.Limiter, string, *benchmarkStats) (bool, error)
-	FetchJobs(context.Context, *http.Client, *rate.Limiter, string) ([]db.Job, error)
+	CheckCompany(context.Context, *http.Client, *requestLimiter, string, *benchmarkStats) (bool, error)
+	FetchJobs(context.Context, *http.Client, *requestLimiter, string) ([]db.Job, error)
 }
 
 var providerRegistry = map[string]jobBoardProvider{}
@@ -67,7 +130,7 @@ func getProvider(name string) (jobBoardProvider, error) {
 func checkProviderCompany(
 	ctx context.Context,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	database *db.DB,
 	name, slug string,
 	stats *benchmarkStats,
@@ -94,7 +157,7 @@ func updateProviderJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	name, slug string,
 ) (int, error) {
 	provider, err := getProvider(name)
@@ -119,7 +182,7 @@ type providerHTTPResponse struct {
 func fetchProviderResponse(
 	ctx context.Context,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	provider jobBoardProvider,
 	slug string,
 	stats *benchmarkStats,
@@ -132,6 +195,7 @@ func fetchProviderResponse(
 	backoff := 500 * time.Millisecond
 	for attempt := 0; attempt < 4; attempt++ {
 		retry := false
+		cooldownStarted := false
 		for i, endpoint := range endpoints {
 			if err := limiter.Wait(ctx); err != nil {
 				return providerHTTPResponse{}, err
@@ -165,7 +229,13 @@ func fetchProviderResponse(
 				res.Body.Close()
 				return providerHTTPResponse{ok: false}, nil
 			}
-			if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			if res.StatusCode == http.StatusTooManyRequests {
+				res.Body.Close()
+				cooldownStarted = limiter.StartCooldown(name) > 0
+				retry = true
+				break
+			}
+			if res.StatusCode >= 500 {
 				res.Body.Close()
 				retry = true
 				break
@@ -192,6 +262,9 @@ func fetchProviderResponse(
 		}
 		if attempt == 3 {
 			return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries", name)
+		}
+		if cooldownStarted {
+			continue
 		}
 		select {
 		case <-time.After(backoff):

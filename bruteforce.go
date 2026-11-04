@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"db"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -33,14 +32,14 @@ type checkPool struct {
 
 	ctx      context.Context
 	client   *http.Client
-	limiter  *rate.Limiter
+	limiter  *requestLimiter
 	database *db.DB
 	stats    *benchmarkStats
 	provider string
 	failures []checkResult
 }
 
-func newCheckPool(ctx context.Context, client *http.Client, limiter *rate.Limiter, database *db.DB, stats *benchmarkStats, provider string, workers int) *checkPool {
+func newCheckPool(ctx context.Context, client *http.Client, limiter *requestLimiter, database *db.DB, stats *benchmarkStats, provider string, workers int) *checkPool {
 	pool := &checkPool{
 		jobs:     make(chan string, checkQueueSize),
 		results:  make(chan checkResult, workers),

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"db"
-	"golang.org/x/time/rate"
 )
 
 type greenhouseProvider struct{}
@@ -28,7 +27,7 @@ func (greenhouseProvider) FallbackOnNotFound() bool { return false }
 func (greenhouseProvider) CheckCompany(
 	ctx context.Context,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	slug string,
 	stats *benchmarkStats,
 ) (bool, error) {
@@ -54,6 +53,8 @@ func (greenhouseProvider) CheckCompany(
 		if stats != nil {
 			stats.recordRequest(time.Since(started), status, requestErr != nil, attempt > 0)
 		}
+		cooldownStarted := requestErr == nil && status == http.StatusTooManyRequests &&
+			limiter.StartCooldown(providerGreenhouse) > 0
 		if requestErr == nil {
 			switch {
 			case status == http.StatusOK || status == http.StatusNoContent:
@@ -67,6 +68,9 @@ func (greenhouseProvider) CheckCompany(
 		if attempt == 3 {
 			return false, fmt.Errorf("gave up checking Greenhouse company after retries")
 		}
+		if cooldownStarted {
+			continue
+		}
 		select {
 		case <-time.After(backoff):
 			backoff *= 2
@@ -78,7 +82,7 @@ func (greenhouseProvider) CheckCompany(
 }
 
 func (greenhouseProvider) FetchJobs(
-	ctx context.Context, client *http.Client, limiter *rate.Limiter, slug string,
+	ctx context.Context, client *http.Client, limiter *requestLimiter, slug string,
 ) ([]db.Job, error) {
 	return fetchGreenhouseJobs(ctx, client, limiter, slug)
 }

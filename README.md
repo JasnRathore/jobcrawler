@@ -27,6 +27,9 @@ go run . --lever --brute --min 3 --max 4 --resume
 # Allow slower HTTP responses up to 45 seconds per request
 go run . --lever --words companies.txt --timeout 45s
 
+# Pause for 3 minutes after a rate-limit response
+go run . --workable --words companies.txt --cooldown 3m
+
 # Fetch jobs for every discovered company, across all providers
 go run . --update --jobs
 
@@ -157,6 +160,7 @@ combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 | `--workers N` | `64` | Number of concurrent workers; must be at least `1` |
 | `--rps N` | `50` | Maximum request rate; must be greater than `0` |
 | `--timeout DURATION` | `10s` | Maximum duration of an individual HTTP request, including reading its response body; e.g. `30s` or `2m`; must be greater than `0` |
+| `--cooldown DURATION` | `2m` | Pause all requests after an HTTP 429 before retrying; e.g. `3m` or `32s`; `0s` disables the cooldown |
 | `--bench` | Off | Benchmark discovery without changing `local.db` |
 | `--update --jobs` | Off | Refresh indexed jobs for every discovered company |
 | `--browse` | Off | Start the local job browser |

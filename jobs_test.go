@@ -27,10 +27,10 @@ type fixtureProvider struct {
 func (p fixtureProvider) Name() string                   { return p.name }
 func (fixtureProvider) CompanyEndpoints(string) []string { return nil }
 func (fixtureProvider) FallbackOnNotFound() bool         { return false }
-func (fixtureProvider) CheckCompany(context.Context, *http.Client, *rate.Limiter, string, *benchmarkStats) (bool, error) {
+func (fixtureProvider) CheckCompany(context.Context, *http.Client, *requestLimiter, string, *benchmarkStats) (bool, error) {
 	return true, nil
 }
-func (p fixtureProvider) FetchJobs(context.Context, *http.Client, *rate.Limiter, string) ([]db.Job, error) {
+func (p fixtureProvider) FetchJobs(context.Context, *http.Client, *requestLimiter, string) ([]db.Job, error) {
 	return []db.Job{p.job}, nil
 }
 
@@ -55,7 +55,7 @@ func TestUpdateAllJobsIncludesEveryRegisteredProvider(t *testing.T) {
 	if err := database.AddCompanyForProvider(ctx, secondFixtureName, "anotherco"); err != nil {
 		t.Fatal(err)
 	}
-	if err := updateAllJobs(ctx, database, &http.Client{}, rate.NewLimiter(rate.Inf, 1), 2); err != nil {
+	if err := updateAllJobs(ctx, database, &http.Client{}, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), 2); err != nil {
 		t.Fatal(err)
 	}
 	jobs, total, err := database.ListJobs(ctx, db.JobFilters{}, false, 10, 0)
@@ -98,7 +98,7 @@ func TestUpdateCompanyJobsReplacesStaleJobsOnlyAfterCompleteResponse(t *testing.
 			Request:    req,
 		}, nil
 	})}
-	limiter := rate.NewLimiter(rate.Inf, 1)
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
 	count, err := updateCompanyJobs(ctx, database, client, limiter, "mcecleanenergy")
 	if err != nil {
@@ -254,7 +254,7 @@ func TestCheckCompanyTreatsNoContentAsFound(t *testing.T) {
 			Request:    req,
 		}, nil
 	})}
-	if err := checkCompany(ctx, client, rate.NewLimiter(rate.Inf, 1), database, "foundcompany", nil); err != nil {
+	if err := checkCompany(ctx, client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, "foundcompany", nil); err != nil {
 		t.Fatalf("checkCompany returned error for 204: %v", err)
 	}
 	companies, err := database.Companies(ctx)

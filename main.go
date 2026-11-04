@@ -55,6 +55,7 @@ func main() {
 	workers := flag.Int("workers", 64, "concurrent workers")
 	rps := flag.Float64("rps", 50, "max requests per second")
 	requestTimeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout (for example 10s or 1m)")
+	cooldown := flag.Duration("cooldown", 2*time.Minute, "pause all requests after HTTP 429 (for example 3m or 32s)")
 	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
 	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
 	flag.Parse()
@@ -70,6 +71,9 @@ func main() {
 	}
 	if *requestTimeout <= 0 {
 		log.Fatal("timeout must be greater than 0")
+	}
+	if *cooldown < 0 {
+		log.Fatal("cooldown must not be negative")
 	}
 	selectedPortals := 0
 	selectedProvider := ""
@@ -141,7 +145,7 @@ func main() {
 	if burst < 1 {
 		burst = 1
 	}
-	limiter := rate.NewLimiter(rate.Limit(*rps), burst)
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Limit(*rps), burst), *cooldown)
 	var stats *benchmarkStats
 	if *bench {
 		stats = newBenchmarkStats()
@@ -292,7 +296,7 @@ func variants(name string) []string {
 func checkCompany(
 	ctx context.Context,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	database *db.DB,
 	slug string,
 	stats *benchmarkStats,
@@ -303,7 +307,7 @@ func checkCompany(
 func checkGreenhouseCompany(
 	ctx context.Context,
 	client *http.Client,
-	limiter *rate.Limiter,
+	limiter *requestLimiter,
 	database *db.DB,
 	slug string,
 	stats *benchmarkStats,

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"db"
 	"golang.org/x/time/rate"
@@ -38,7 +39,7 @@ func TestLeverEUProviderChecksAndIndexesJobs(t *testing.T) {
 		}
 		return providerResponse(req, http.StatusOK, body), nil
 	})}
-	limiter := rate.NewLimiter(rate.Inf, 1)
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
 	if err := checkProviderCompany(ctx, client, limiter, database, providerLeverEU, "example", nil); err != nil {
 		t.Fatal(err)
@@ -76,7 +77,7 @@ func TestLeverProviderUsesUSAPIOnly(t *testing.T) {
 		}
 		return providerResponse(req, http.StatusOK, `[]`), nil
 	})}
-	if err := checkProviderCompany(context.Background(), client, rate.NewLimiter(rate.Inf, 1), nil, providerLever, "example", nil); err != nil {
+	if err := checkProviderCompany(context.Background(), client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), nil, providerLever, "example", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -129,7 +130,7 @@ func TestWorkableProviderChecksAndIndexesJobs(t *testing.T) {
 		}
 		return providerResponse(req, http.StatusOK, body), nil
 	})}
-	limiter := rate.NewLimiter(rate.Inf, 1)
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
 	if err := checkProviderCompany(ctx, client, limiter, database, providerWorkable, "example", nil); err != nil {
 		t.Fatal(err)
@@ -154,6 +155,34 @@ func TestWorkableProviderChecksAndIndexesJobs(t *testing.T) {
 		jobs[0].EmploymentType != "Full-time" || jobs[0].Department != "Sales" ||
 		jobs[0].WorkplaceType != "onsite" {
 		t.Fatalf("unexpected Workable job index: %+v", jobs)
+	}
+}
+
+func TestWorkable429StartsSharedCooldownBeforeRetry(t *testing.T) {
+	const cooldown = 80 * time.Millisecond
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			return providerResponse(req, http.StatusTooManyRequests, ""), nil
+		}
+		return providerResponse(req, http.StatusOK, `{"name":"Example","jobs":[]}`), nil
+	})}
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
+
+	started := time.Now()
+	found, err := (workableProvider{}).CheckCompany(context.Background(), client, limiter, "example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("Workable company was not found after the retry")
+	}
+	if requests != 2 {
+		t.Fatalf("made %d requests, want 2", requests)
+	}
+	if elapsed := time.Since(started); elapsed < cooldown {
+		t.Fatalf("retry completed after %s, before the %s cooldown", elapsed, cooldown)
 	}
 }
 
@@ -202,7 +231,7 @@ func TestAshbyHQProviderChecksAndIndexesListedJobs(t *testing.T) {
 		}
 		return providerResponse(req, http.StatusOK, body), nil
 	})}
-	limiter := rate.NewLimiter(rate.Inf, 1)
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
 	if err := checkProviderCompany(ctx, client, limiter, database, providerAshbyHQ, "example", nil); err != nil {
 		t.Fatal(err)

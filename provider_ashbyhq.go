@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"db"
-	"golang.org/x/time/rate"
 )
 
 type ashbyHQProvider struct{}
@@ -28,7 +27,7 @@ func (ashbyHQProvider) CompanyEndpoints(slug string) []string {
 func (ashbyHQProvider) FallbackOnNotFound() bool { return false }
 
 func (p ashbyHQProvider) CheckCompany(
-	ctx context.Context, client *http.Client, limiter *rate.Limiter, slug string, stats *benchmarkStats,
+	ctx context.Context, client *http.Client, limiter *requestLimiter, slug string, stats *benchmarkStats,
 ) (bool, error) {
 	response, err := fetchProviderResponse(ctx, client, limiter, p, slug, stats)
 	if err != nil || !response.ok {
@@ -45,7 +44,7 @@ func (p ashbyHQProvider) CheckCompany(
 }
 
 func (p ashbyHQProvider) FetchJobs(
-	ctx context.Context, client *http.Client, limiter *rate.Limiter, slug string,
+	ctx context.Context, client *http.Client, limiter *requestLimiter, slug string,
 ) ([]db.Job, error) {
 	response, err := fetchProviderResponse(ctx, client, limiter, p, slug, nil)
 	if err != nil {
