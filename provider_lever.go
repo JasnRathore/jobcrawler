@@ -128,15 +128,15 @@ func parseLeverJobs(slug string, body []byte) ([]db.Job, error) {
 		if err != nil {
 			return nil, fmt.Errorf("normalize Lever attributes: %w", err)
 		}
-		detailsURL := posting.HostedURL
-		if detailsURL == "" {
-			detailsURL = posting.ApplyURL
+		jobURL := posting.HostedURL
+		if jobURL == "" {
+			jobURL = strings.TrimSuffix(posting.ApplyURL, "/apply")
 		}
 		jobs = append(jobs, db.Job{
 			JobKey: posting.ID, Title: posting.Text, CompanyName: slug,
 			LocationName: posting.Categories.Location, EmploymentType: posting.Categories.Commitment,
 			WorkplaceType: normalizeWorkplaceType(posting.WorkplaceType),
-			Department:    posting.Categories.Team, DetailsURL: detailsURL, ApplyURL: posting.ApplyURL,
+			Department:    posting.Categories.Team, DetailsURL: jobURL, ApplyURL: jobURL,
 			UpdatedAt: published, FirstPublished: published, Description: strings.TrimSpace(description),
 			AttributesJSON: string(attributes),
 		})

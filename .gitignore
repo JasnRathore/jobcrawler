@@ -1,8 +1,13 @@
 local.db
 local.db-wal
+local.db-wal-revert
+local.db-changes
+local.db-info
 local-copy.db
 reference.txt
 failedc.txt
 failed.txt
-
+.env
 scripts/.playwright/profile/
+/frontend
+crawler.exe

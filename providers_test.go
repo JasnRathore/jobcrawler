@@ -59,7 +59,8 @@ func TestLeverEUProviderChecksAndIndexesJobs(t *testing.T) {
 	if total != 1 || len(jobs) != 1 || jobs[0].JobKey != "lever-job-1" ||
 		jobs[0].LocationName != "North Attleboro, MA" || !strings.Contains(jobs[0].Description, "Help customers.") ||
 		!strings.Contains(jobs[0].Description, "Serve customers") || jobs[0].WorkplaceType != "hybrid" ||
-		jobs[0].ApplyURL != "https://jobs.lever.co/example/lever-job-1/apply" {
+		jobs[0].DetailsURL != "https://jobs.lever.co/example/lever-job-1" ||
+		jobs[0].ApplyURL != "https://jobs.lever.co/example/lever-job-1" {
 		t.Fatalf("unexpected Lever job index: %+v", jobs)
 	}
 	saved, err := database.ToggleProviderBookmark(ctx, providerLeverEU, "example", "lever-job-1")
@@ -77,6 +78,21 @@ func TestLeverProviderUsesUSAPIOnly(t *testing.T) {
 	})}
 	if err := checkProviderCompany(context.Background(), client, rate.NewLimiter(rate.Inf, 1), nil, providerLever, "example", nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLeverJobUsesBaseURLWhenHostedURLIsMissing(t *testing.T) {
+	jobs, err := parseLeverJobs("example", []byte(`[{
+		"id":"lever-job-1",
+		"text":"Retail Associate",
+		"applyUrl":"https://jobs.lever.co/example/lever-job-1/apply"
+	}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantURL = "https://jobs.lever.co/example/lever-job-1"
+	if len(jobs) != 1 || jobs[0].DetailsURL != wantURL || jobs[0].ApplyURL != wantURL {
+		t.Fatalf("Lever job URLs = details %q, apply %q; want %q", jobs[0].DetailsURL, jobs[0].ApplyURL, wantURL)
 	}
 }
 
