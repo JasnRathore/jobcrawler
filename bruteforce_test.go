@@ -131,9 +131,6 @@ func TestRunBruteForceSupportsAllProviders(t *testing.T) {
 			gotRequests := requests
 			mu.Unlock()
 			wantRequests := int(bruteCount(1, 1))
-			if provider == providerLever {
-				wantRequests *= 2
-			}
 			if gotRequests != wantRequests {
 				t.Fatalf("%s made %d requests, want %d", provider, gotRequests, wantRequests)
 			}
@@ -202,6 +199,43 @@ func TestRunBruteForceSavesFailuresAndContinuesUpToFivePerCheckpoint(t *testing.
 				}
 			}
 		})
+	}
+}
+
+func TestWordlistCheckFailuresAreSaved(t *testing.T) {
+	ctx := context.Background()
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return providerResponse(req, http.StatusBadRequest, ""), nil
+	})}
+	pool := newCheckPool(ctx, client, rate.NewLimiter(rate.Inf, 1), nil, nil, providerGreenhouse, 1)
+	if _, ok := pool.submit("failed-slug"); !ok {
+		t.Fatal("check pool rejected candidate")
+	}
+	pool.flush()
+	path := filepath.Join(t.TempDir(), "failed.txt")
+	if err := saveCheckFailures(pool, path); err != nil {
+		t.Fatal(err)
+	}
+	if failures := pool.close(); failures != 0 {
+		t.Fatalf("check pool reported %d remaining failures", failures)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(content), "failed-slug\n"; got != want {
+		t.Fatalf("failed.txt = %q, want %q", got, want)
+	}
+	if err := saveCheckFailures(pool, path); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(content), "failed-slug\n"; got != want {
+		t.Fatalf("failure was written more than once: got %q, want %q", got, want)
 	}
 }
 

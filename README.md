@@ -24,6 +24,9 @@ go run . --greenhouse --words companies.txt
 # Discover Lever companies by trying slugs from length 3 through 4
 go run . --lever --brute --min 3 --max 4 --resume
 
+# Allow slower HTTP responses up to 45 seconds per request
+go run . --lever --words companies.txt --timeout 45s
+
 # Fetch jobs for every discovered company, across all providers
 go run . --update --jobs
 
@@ -32,7 +35,8 @@ go run . --browse
 ```
 
 By default, discovery uses Greenhouse. The provider flags select exactly one
-provider: `--greenhouse`, `--lever`, or `--workable`.
+provider: `--greenhouse`, `--lever`, `--levereu`, `--workable`, or
+`--ashbyhq`.
 
 ## Discover companies
 
@@ -44,7 +48,9 @@ requires an explicit provider flag:
 ```powershell
 go run . --greenhouse --words companies.txt
 go run . --lever --words companies.txt
+go run . --levereu --words companies.txt
 go run . --workable --words companies.txt
+go run . --ashbyhq --words companies.txt
 ```
 
 For each non-empty name, the crawler lowercases it, removes common company
@@ -61,7 +67,9 @@ range. It works with all supported providers:
 ```powershell
 go run . --greenhouse --brute --min 3 --max 3
 go run . --lever --brute --min 3 --max 4 --resume
+go run . --levereu --brute --min 3 --max 4 --resume
 go run . --workable --brute --min 2 --max 3 --resume
+go run . --ashbyhq --brute --min 2 --max 3 --resume
 ```
 
 The default range is 4–5 characters. The maximum length is 13 when brute
@@ -69,11 +77,12 @@ force is enabled; large ranges can take a very long time. Use `--resume` to
 save progress in provider-specific checkpoints in `local.db` and continue that
 same provider and length range later. `--resume` requires `--brute`.
 
-Failed brute-force slugs are appended to `failed.txt`, one per line, so they
-can be reviewed or retried. With `--resume`, a checkpoint continues if it has
-at most five failed checks; more than five failures stop that checkpoint
-without advancing its saved position. Word-list mode generates variants from
-each line, so it may check additional variants when retrying failed slugs.
+Failed slugs from both word-list and brute-force checks are appended to
+`failed.txt`, one per line, so they can be reviewed or retried. With `--resume`,
+a checkpoint continues if it has at most five failed checks; more than five
+failures stop that checkpoint without advancing its saved position. Word-list
+mode generates variants from each line, so it may check additional variants
+when retrying failed slugs.
 
 You can combine `--words` and `--brute` in one run, but word-list mode requires
 an explicit provider. Candidates already submitted from the word list are
@@ -123,6 +132,8 @@ Measure discovery request performance without modifying `local.db`:
 ```powershell
 go run . --bench --greenhouse --brute --min 2 --max 2
 go run . --bench --lever --words companies.txt
+go run . --bench --levereu --words companies.txt
+go run . --bench --ashbyhq --words companies.txt
 ```
 
 Benchmark mode uses a temporary database and prints request, retry, status,
@@ -135,7 +146,9 @@ combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 |---|---:|---|
 | `--greenhouse` | Selected if no provider flag is given | Discover companies on Greenhouse |
 | `--lever` | Off | Discover companies on Lever |
+| `--levereu` | Off | Discover companies on Lever's EU API |
 | `--workable` | Off | Discover companies on Workable |
+| `--ashbyhq` | Off | Discover companies on Ashby |
 | `--words FILE` | None | Read company names or slugs from a file, one per line; requires an explicit provider |
 | `--brute` | Off | Brute-force slugs in the selected length range |
 | `--resume` | Off | Save/resume brute-force checkpoints; requires `--brute` |
@@ -143,6 +156,7 @@ combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 | `--max N` | `5` | Maximum candidate slug length; brute force allows at most `13` |
 | `--workers N` | `64` | Number of concurrent workers; must be at least `1` |
 | `--rps N` | `50` | Maximum request rate; must be greater than `0` |
+| `--timeout DURATION` | `10s` | Maximum duration of an individual HTTP request, including reading its response body; e.g. `30s` or `2m`; must be greater than `0` |
 | `--bench` | Off | Benchmark discovery without changing `local.db` |
 | `--update --jobs` | Off | Refresh indexed jobs for every discovered company |
 | `--browse` | Off | Start the local job browser |

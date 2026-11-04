@@ -733,10 +733,14 @@ func serveJobBrowser(ctx context.Context, database *db.DB, address string) error
 
 func providerDisplayName(provider string) string {
 	switch provider {
+	case providerAshbyHQ:
+		return "Ashby"
 	case providerGreenhouse:
 		return "Greenhouse"
 	case providerLever:
 		return "Lever"
+	case providerLeverEU:
+		return "Lever EU"
 	case providerWorkable:
 		return "Workable"
 	default:

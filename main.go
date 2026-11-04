@@ -54,6 +54,7 @@ func main() {
 	browseAddress := flag.String("addr", "127.0.0.1:8080", "job browser listen address")
 	workers := flag.Int("workers", 64, "concurrent workers")
 	rps := flag.Float64("rps", 50, "max requests per second")
+	requestTimeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout (for example 10s or 1m)")
 	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
 	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
 	flag.Parse()
@@ -66,6 +67,9 @@ func main() {
 	}
 	if *rps <= 0 {
 		log.Fatal("rps must be greater than 0")
+	}
+	if *requestTimeout <= 0 {
+		log.Fatal("timeout must be greater than 0")
 	}
 	selectedPortals := 0
 	selectedProvider := ""
@@ -132,7 +136,7 @@ func main() {
 		defer database.Close()
 	}
 
-	client := newClient(*workers)
+	client := newClient(*workers, *requestTimeout)
 	burst := int(*rps)
 	if burst < 1 {
 		burst = 1
@@ -149,7 +153,6 @@ func main() {
 		return
 	}
 	if *update && *updateJobsFlag {
-		client.Timeout = 30 * time.Second
 		if err := updateAllJobs(ctx, database, client, limiter, *workers); err != nil {
 			log.Fatal(err)
 		}
@@ -182,7 +185,10 @@ func main() {
 	}
 	pool.flush()
 	var runErr error
-	if *brute {
+	if *words != "" {
+		runErr = saveCheckFailures(pool, "failed.txt")
+	}
+	if *brute && runErr == nil {
 		runErr = runBruteForce(ctx, pool, seen, database, minSlugLength, maxSlugLength, *resume, "failed.txt")
 	}
 
@@ -235,7 +241,7 @@ func newBenchmarkDatabase(ctx context.Context) (*db.DB, func(), error) {
 	return database, cleanup, nil
 }
 
-func newClient(workers int) *http.Client {
+func newClient(workers int, timeout time.Duration) *http.Client {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -248,7 +254,7 @@ func newClient(workers int) *http.Client {
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 3 * time.Second,
 	}
-	return &http.Client{Transport: tr, Timeout: 8 * time.Second}
+	return &http.Client{Transport: tr, Timeout: timeout}
 }
 
 func feedWordlist(path string, emit func(string) bool) error {

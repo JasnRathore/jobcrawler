@@ -2,3 +2,7 @@ local.db
 local.db-wal
 local-copy.db
 reference.txt
+failedc.txt
+failed.txt
+
+scripts/.playwright/profile/

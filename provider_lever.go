@@ -14,23 +14,24 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type leverProvider struct{}
+type leverProvider struct {
+	name    string
+	apiHost string
+}
 
 func init() {
-	registerProvider(leverProvider{})
+	registerProvider(leverProvider{name: providerLever, apiHost: "api.lever.co"})
+	registerProvider(leverProvider{name: providerLeverEU, apiHost: "api.eu.lever.co"})
 }
 
-func (leverProvider) Name() string { return providerLever }
+func (p leverProvider) Name() string { return p.name }
 
-func (leverProvider) CompanyEndpoints(slug string) []string {
+func (p leverProvider) CompanyEndpoints(slug string) []string {
 	escaped := url.PathEscape(slug)
-	return []string{
-		"https://api.lever.co/v0/postings/" + escaped + "?mode=json",
-		"https://api.eu.lever.co/v0/postings/" + escaped + "?mode=json",
-	}
+	return []string{"https://" + p.apiHost + "/v0/postings/" + escaped + "?mode=json"}
 }
 
-func (leverProvider) FallbackOnNotFound() bool { return true }
+func (leverProvider) FallbackOnNotFound() bool { return false }
 
 func (p leverProvider) CheckCompany(
 	ctx context.Context, client *http.Client, limiter *rate.Limiter, slug string, stats *benchmarkStats,

@@ -14,8 +14,10 @@ import (
 )
 
 const (
+	providerAshbyHQ    = "ashbyhq"
 	providerGreenhouse = "greenhouse"
 	providerLever      = "lever"
+	providerLeverEU    = "levereu"
 	providerWorkable   = "workable"
 )
 

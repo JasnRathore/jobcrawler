@@ -101,6 +101,14 @@ func (p *checkPool) takeFailures() []checkResult {
 	return failures
 }
 
+func saveCheckFailures(pool *checkPool, path string) error {
+	failures := pool.takeFailures()
+	if len(failures) == 0 {
+		return nil
+	}
+	return appendFailedCandidates(path, failures)
+}
+
 func (p *checkPool) close() int {
 	failures := p.flush()
 	close(p.jobs)
