@@ -182,7 +182,12 @@ func run() (returnErr error) {
 	}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Limit(*rps), burst), *cooldown)
 	var proxies *proxyPool
-	if *proxiesPath != "off" {
+	if *browse {
+		// The browser serves local data; no remote requests, no pool needed.
+		if *proxiesPath != "off" {
+			log.Printf("--proxies has no effect with --browse")
+		}
+	} else if *proxiesPath != "off" {
 		proxies, err = loadProxyPool(ctx, *proxiesPath, proxyPoolConfig{
 			minReuseGap:     *proxyReuseGap,
 			maxFailures:     *proxyFailures,
