@@ -240,7 +240,7 @@ func fetchGreenhouseJobs(
 				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 				lease.release(proxyOutcomeRateLimited, retryAfter)
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
-				if pool != nil {
+				if pool != nil && !lease.directFallback {
 					// Rate limiting is per egress IP; rotate to a fresh peer.
 					if attempt == 3 {
 						return nil, fmt.Errorf("fetch jobs after retries: %w", err)

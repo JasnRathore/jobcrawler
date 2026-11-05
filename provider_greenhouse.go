@@ -34,6 +34,7 @@ func (greenhouseProvider) CheckCompany(
 ) (bool, error) {
 	requestURL := fmt.Sprintf(baseURL, slug)
 	backoff := 500 * time.Millisecond
+	lastFailure := ""
 	for attempt := 0; attempt < 4; attempt++ {
 		lease, leaseErr := acquireLease(ctx, pool, client)
 		if leaseErr != nil {
@@ -63,6 +64,7 @@ func (greenhouseProvider) CheckCompany(
 		switch {
 		case requestErr != nil:
 			lease.release(proxyOutcomeFailed, 0)
+			lastFailure = fmt.Sprintf("transport error: %v", requestErr)
 		case status == http.StatusOK || status == http.StatusNoContent:
 			lease.release(proxyOutcomeOK, 0)
 			return true, nil
@@ -72,17 +74,19 @@ func (greenhouseProvider) CheckCompany(
 		case status == http.StatusTooManyRequests:
 			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 			lease.release(proxyOutcomeRateLimited, retryAfter)
+			lastFailure = fmt.Sprintf("status %d (Retry-After %s)", status, retryAfter)
 		case status >= 500:
 			lease.release(proxyOutcomeFailed, 0)
+			lastFailure = fmt.Sprintf("status %d", status)
 		default:
 			lease.release(proxyOutcomeFailed, 0)
 			return false, fmt.Errorf("unexpected status %d", status)
 		}
 		if attempt == 3 {
-			return false, fmt.Errorf("gave up checking Greenhouse company after retries")
+			return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
 		}
 		if status == http.StatusTooManyRequests {
-			if pool != nil {
+			if pool != nil && !lease.directFallback {
 				// Rate limiting is per egress IP; rotate to a fresh peer.
 				continue
 			}

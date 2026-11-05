@@ -196,6 +196,7 @@ func fetchProviderResponse(
 		return providerHTTPResponse{}, fmt.Errorf("%s provider returned no request endpoints", name)
 	}
 	backoff := 500 * time.Millisecond
+	lastFailure := ""
 	for attempt := 0; attempt < 4; attempt++ {
 		retry := false
 		skipBackoff := false
@@ -228,6 +229,7 @@ func fetchProviderResponse(
 					res.Body.Close()
 				}
 				lease.release(proxyOutcomeFailed, 0)
+				lastFailure = fmt.Sprintf("transport error: %v", requestErr)
 				retry = true
 				break
 			}
@@ -245,7 +247,10 @@ func fetchProviderResponse(
 				res.Body.Close()
 				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 				lease.release(proxyOutcomeRateLimited, retryAfter)
-				if pool == nil {
+				lastFailure = fmt.Sprintf("status %d (Retry-After %s)", res.StatusCode, retryAfter)
+				if pool == nil || lease.directFallback {
+					// A drained-pool fallback still leaves us on the
+					// host-wide egress IP; treat 429s like direct mode.
 					skipBackoff = limiter.StartCooldown(name) > 0
 				} else {
 					// Rate limiting is per egress IP; the leased peer cools
@@ -258,6 +263,7 @@ func fetchProviderResponse(
 			if res.StatusCode >= 500 {
 				res.Body.Close()
 				lease.release(proxyOutcomeFailed, 0)
+				lastFailure = fmt.Sprintf("status %d", res.StatusCode)
 				retry = true
 				break
 			}
@@ -287,7 +293,7 @@ func fetchProviderResponse(
 			return providerHTTPResponse{ok: false}, nil
 		}
 		if attempt == 3 {
-			return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries", name)
+			return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries (last: %s)", name, lastFailure)
 		}
 		if skipBackoff {
 			continue
@@ -299,7 +305,7 @@ func fetchProviderResponse(
 			return providerHTTPResponse{}, ctx.Err()
 		}
 	}
-	return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries", name)
+	return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries (last: %s)", name, lastFailure)
 }
 
 func normalizeWorkplaceType(value string) string {

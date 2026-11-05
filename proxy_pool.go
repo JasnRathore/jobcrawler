@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -120,14 +121,19 @@ const (
 )
 
 // loadProxyPool reads a proxy list file, keeps alive elite http/socks5
-// entries ordered by uptime (best first), dials each address once, and
-// keeps only peers that accepted a connection within probeTimeout.
+// entries ordered by uptime (best first), validates each peer, and keeps
+// only peers that answered within probeTimeout. With a non-empty probeURL
+// each peer receives one real GET through its own proxy client and any
+// HTTP status proves the tunnel reaches the target; with an empty probeURL
+// the probe falls back to a plain TCP dial, which only proves address
+// reachability.
 func loadProxyPool(
 	ctx context.Context,
 	path string,
 	cfg proxyPoolConfig,
 	probeTimeout time.Duration,
 	requestTimeout time.Duration,
+	probeURL string,
 ) (*proxyPool, error) {
 	if probeTimeout <= 0 {
 		return nil, errors.New("proxy probe timeout must be greater than 0")
@@ -182,7 +188,7 @@ func loadProxyPool(
 		ordered = append(ordered, candidate.peer)
 	}
 
-	probed := probeProxyPeers(ctx, ordered, probeTimeout)
+	probed := probeProxyPeers(ctx, ordered, probeTimeout, probeURL)
 	if len(probed) == 0 {
 		return nil, fmt.Errorf("no proxy passed the health probe from %s", path)
 	}
@@ -192,10 +198,9 @@ func loadProxyPool(
 	return &proxyPool{peers: probed, healthy: len(probed), cfg: cfg}, nil
 }
 
-// probeProxyPeers dials every peer address concurrently and returns only
-// the peers whose address accepted a TCP connection in time, preserving
-// the original order.
-func probeProxyPeers(ctx context.Context, peers []*proxyPeer, timeout time.Duration) []*proxyPeer {
+// probeProxyPeers validates every peer concurrently and returns only the
+// peers that answered, preserving the original order.
+func probeProxyPeers(ctx context.Context, peers []*proxyPeer, timeout time.Duration, probeURL string) []*proxyPeer {
 	dialer := &net.Dialer{Timeout: timeout}
 	jobs := make(chan *proxyPeer)
 	survivors := make([]bool, len(peers))
@@ -205,7 +210,7 @@ func probeProxyPeers(ctx context.Context, peers []*proxyPeer, timeout time.Durat
 		go func() {
 			defer wg.Done()
 			for peer := range jobs {
-				if dialProxyPeer(ctx, dialer, peer.raw) == nil {
+				if probePeer(ctx, dialer, peer, timeout, probeURL) {
 					survivors[indexOfPeer(peers, peer)] = true
 				}
 			}
@@ -224,6 +229,28 @@ func probeProxyPeers(ctx context.Context, peers []*proxyPeer, timeout time.Durat
 		}
 	}
 	return kept
+}
+
+// probePeer validates one peer. A non-empty probeURL sends a real GET
+// through the proxy and any HTTP status (4xx and 5xx included) proves the
+// CONNECT tunnel and TLS handshake work; a transport failure drops the
+// peer. An empty probeURL only dials the proxy address over TCP.
+func probePeer(ctx context.Context, dialer *net.Dialer, peer *proxyPeer, timeout time.Duration, probeURL string) bool {
+	if probeURL == "" {
+		return dialProxyPeer(ctx, dialer, peer.raw) == nil
+	}
+	probeClient := &http.Client{Transport: peer.client.Transport, Timeout: timeout}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return false
+	}
+	res, err := probeClient.Do(req)
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, io.LimitReader(res.Body, 512))
+	res.Body.Close()
+	return true
 }
 
 func indexOfPeer(peers []*proxyPeer, peer *proxyPeer) int {
@@ -401,11 +428,13 @@ func (p *proxyPool) warnDirectFallback() {
 
 // requestLease ties one HTTP request to the peer that serves it. Proxies
 // off (nil pool) and direct fallback both yield a lease whose client is
-// the direct client.
+// the direct client; directFallback records which case, so callers can
+// keep direct-mode rate-limit handling when the pool is drained.
 type requestLease struct {
-	pool   *proxyPool
-	peer   *proxyPeer
-	client *http.Client
+	pool           *proxyPool
+	peer           *proxyPeer
+	client         *http.Client
+	directFallback bool
 }
 
 func acquireLease(ctx context.Context, pool *proxyPool, client *http.Client) (requestLease, error) {
@@ -417,7 +446,7 @@ func acquireLease(ctx context.Context, pool *proxyPool, client *http.Client) (re
 		return requestLease{}, err
 	}
 	if direct {
-		return requestLease{client: client}, nil
+		return requestLease{client: client, directFallback: true}, nil
 	}
 	return requestLease{pool: pool, peer: peer, client: peer.client}, nil
 }

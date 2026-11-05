@@ -188,12 +188,21 @@ func run() (returnErr error) {
 			log.Printf("--proxies has no effect with --browse")
 		}
 	} else if *proxiesPath != "off" {
+		// Validate proxies against the provider this run will actually use:
+		// any HTTP response proves the tunnel works; a bare TCP dial would
+		// admit proxies that open connections but never forward CONNECT.
+		probeURL := ""
+		if probeProvider, providerErr := getProvider(provider); providerErr == nil {
+			if endpoints := probeProvider.CompanyEndpoints("probe"); len(endpoints) > 0 {
+				probeURL = endpoints[0]
+			}
+		}
 		proxies, err = loadProxyPool(ctx, *proxiesPath, proxyPoolConfig{
 			minReuseGap:     *proxyReuseGap,
 			maxFailures:     *proxyFailures,
 			retryAfterFloor: time.Second,
 			maxCooldown:     *cooldown,
-		}, *proxyProbeTimeout, *requestTimeout)
+		}, *proxyProbeTimeout, *requestTimeout, probeURL)
 		if err != nil {
 			return err
 		}

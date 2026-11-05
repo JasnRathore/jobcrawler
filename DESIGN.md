@@ -68,6 +68,7 @@ out from the local address and the switch is logged at most once per 30 s
 | --- | --- | --- |
 | `2xx` | `failures = 0` | — (request done) |
 | `429` | `failures++`, cooldown = `max(Retry-After, 1s floor)`, capped by `--cooldown` | rotate to a fresh peer, no backoff wait |
+| `429` on a direct fallback lease (pool drained) | host-wide cooldown via the shared limiter, as in direct mode | wait the cooldown |
 | `5xx` / transport error | `failures++` | rotate to a fresh peer, standard backoff |
 | other status | request fails (no retry, as before) | — |
 | consecutive failures ≥ `--proxy-failures` | peer evicted; idle connections closed | peer never leased again |
@@ -80,14 +81,19 @@ for `--cooldown` — and the pool code is not executed.
 ### Startup probe
 
 `loadProxyPool` reads the list (`free-proxy-list.json` in this repository is
-a single-line JSON array of `proxy`/`protocol`/`alive`/`anonymity`/`uptime`
-entries), keeps `alive` entries with `http` or `socks5` protocol and elite
-anonymity, deduplicates, sorts by uptime (highest first), then **dials each
-address once** with 64 concurrent probes and a `--proxy-probe-timeout`
-budget (default 3 s), keeping only reachable addresses. The probe is a TCP
-dial, not a full CONNECT handshake, so it validates reachability only.
-Starting with a pool where already-dead proxies were not filtered is an
-error.
+a JSON object whose `proxies` field holds an array of
+`proxy`/`protocol`/`alive`/`anonymity`/`uptime` records; a bare array is
+accepted too), keeps `alive` entries with `http` or `socks5` protocol and
+elite anonymity, deduplicates, sorts by uptime (highest first), then
+**validates each peer** with 64 concurrent probes and a
+`--proxy-probe-timeout` budget (default 3 s). With a provider endpoint
+available, the probe sends one real GET through the peer's own proxy
+client: **any HTTP status — 4xx and 5xx included — proves the CONNECT
+tunnel and TLS handshake work**, and only a transport failure drops the
+peer. A TCP open on the proxy address without a working tunnel is the most
+common free-proxy failure, so the tunnel check is what keeps the pool
+usable; the probe issues one small request to the provider per candidate
+peer. Starting with a pool containing zero surviving peers is an error.
 
 ### Wire format
 
@@ -120,7 +126,13 @@ is per egress IP and the direct client remains untouched.
 
 `proxy_pool_test.go` covers lease exclusivity, LRU selection, reuse gaps,
 `Retry-After` flooring/capping, eviction, direct fallback and context
-cancellation at the state-machine level, plus list filtering/ordering and a
-`429 → rotate → 200` integration test through `fetchProviderResponse`.
-Existing tests keep passing with a nil pool, which pins down the
-`--proxies off` behavior.
+cancellation at the state-machine level, plus list filtering/ordering
+(bare array and object-wrapped lists), the tunnel-vs-TCP probe decision,
+and a `429 → rotate → 200` integration test through
+`fetchProviderResponse`. Existing tests keep passing with a nil pool,
+which pins down the `--proxies off` behavior.
+
+Failure diagnostics: when attempts are exhausted the error carries the
+last failure cause, e.g. `fetch ashbyhq response after retries (last:
+transport error: dial tcp 45.74.31.41:10867: i/o timeout)`, so dead-tunnel
+proxies are visible in the per-slug failure log without extra tooling.

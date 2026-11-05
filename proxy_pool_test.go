@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -298,7 +300,7 @@ func TestLoadProxyPoolFiltersAndKeepsUptimeOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pool, err := loadProxyPool(context.Background(), path, freeConfig(), time.Second, 5*time.Second)
+	pool, err := loadProxyPool(context.Background(), path, freeConfig(), time.Second, 5*time.Second, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,8 +349,31 @@ func TestLoadProxyPoolFailsWithoutAliveProxy(t *testing.T) {
 	if err := os.WriteFile(path, []byte("["+content+"]"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadProxyPool(context.Background(), path, freeConfig(), 300*time.Millisecond, 5*time.Second); err == nil {
+	if _, err := loadProxyPool(context.Background(), path, freeConfig(), 300*time.Millisecond, 5*time.Second, ""); err == nil {
 		t.Fatal("expected an error when no proxy passes the health probe")
+	}
+}
+
+func TestProbePeerTunnelCheckDropsDeadTunnels(t *testing.T) {
+	alivePeer := &proxyPeer{raw: "http://alive:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Status:     "404 Not Found",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}}
+	deadTunnelPeer := &proxyPeer{raw: "http://dead:80", client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("proxy: CONNECT tunnel to target refused")
+	})}}
+
+	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
+	if !probePeer(context.Background(), dialer, alivePeer, time.Second, "https://boards.example/boards/probe") {
+		t.Fatal("tunnel-capable peer was dropped")
+	}
+	if probePeer(context.Background(), dialer, deadTunnelPeer, time.Second, "https://boards.example/boards/probe") {
+		t.Fatal("transport-error proxy passed the tunnel probe")
 	}
 }
 
