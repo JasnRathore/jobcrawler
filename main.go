@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -36,6 +37,12 @@ var (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (returnErr error) {
 	words := flag.String("words", "", "file with company names or slugs, one per line")
 	brute := flag.Bool("brute", false, "also brute-force slugs (low priority)")
 	bench := flag.Bool("bench", false, "benchmark requests without modifying local.db")
@@ -61,19 +68,19 @@ func main() {
 	flag.Parse()
 
 	if minSlugLength < 1 || maxSlugLength < minSlugLength || (*brute && maxSlugLength > 13) {
-		log.Fatalf("invalid length range: min=%d max=%d", minSlugLength, maxSlugLength)
+		return fmt.Errorf("invalid length range: min=%d max=%d", minSlugLength, maxSlugLength)
 	}
 	if *workers < 1 {
-		log.Fatal("workers must be at least 1")
+		return errors.New("workers must be at least 1")
 	}
 	if *rps <= 0 {
-		log.Fatal("rps must be greater than 0")
+		return errors.New("rps must be greater than 0")
 	}
 	if *requestTimeout <= 0 {
-		log.Fatal("timeout must be greater than 0")
+		return errors.New("timeout must be greater than 0")
 	}
 	if *cooldown < 0 {
-		log.Fatal("cooldown must not be negative")
+		return errors.New("cooldown must not be negative")
 	}
 	selectedPortals := 0
 	selectedProvider := ""
@@ -84,7 +91,7 @@ func main() {
 		}
 	}
 	if selectedPortals > 1 {
-		log.Fatal("choose only one provider flag")
+		return errors.New("choose only one provider flag")
 	}
 	provider := providerGreenhouse
 	if selectedProvider != "" {
@@ -95,19 +102,19 @@ func main() {
 		for _, name := range registeredProviders() {
 			options = append(options, "--"+name)
 		}
-		log.Fatalf("--words requires an explicit provider flag: %s", strings.Join(options, ", "))
+		return fmt.Errorf("--words requires an explicit provider flag: %s", strings.Join(options, ", "))
 	}
 	if *resume && (!*brute || *bench || *words != "" || *browse || *update) {
-		log.Fatal("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
+		return errors.New("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
 	}
 	if *update != *updateJobsFlag {
-		log.Fatal("--update and --jobs must be used together")
+		return errors.New("--update and --jobs must be used together")
 	}
 	if *bench && *update {
-		log.Fatal("--bench cannot be combined with --update or --jobs")
+		return errors.New("--bench cannot be combined with --update or --jobs")
 	}
 	if *browse && (*bench || *update) {
-		log.Fatal("--browse cannot be combined with --bench or --update")
+		return errors.New("--browse cannot be combined with --bench or --update")
 	}
 	if *brute && maxSlugLength >= 6 {
 		log.Printf("warning: brute force up to length %d means %d candidates",
@@ -125,7 +132,7 @@ func main() {
 	if *bench {
 		database, benchmarkClean, err = newBenchmarkDatabase(ctx)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		defer func() {
 			if benchmarkClean != nil {
@@ -133,11 +140,26 @@ func main() {
 			}
 		}()
 	} else {
-		database, err = db.New(ctx, "local.db")
-		if err != nil {
-			log.Fatal(err)
+		config, configErr := loadDatabaseConfig(".env")
+		if configErr != nil {
+			return fmt.Errorf("load database configuration: %w", configErr)
 		}
-		defer database.Close()
+		if config.mode == "remote" {
+			database, err = db.NewRemote(ctx, config.tursoURL, config.tursoToken)
+			if err == nil {
+				log.Print("connected directly to remote Turso database")
+			}
+		} else {
+			database, err = db.New(ctx, config.localPath)
+		}
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := database.Close(); err != nil {
+				returnErr = errors.Join(returnErr, err)
+			}
+		}()
 	}
 
 	client := newClient(*workers, *requestTimeout)
@@ -152,15 +174,15 @@ func main() {
 	}
 	if *browse {
 		if err := serveJobBrowser(ctx, database, *browseAddress); err != nil {
-			log.Fatal(err)
+			return err
 		}
-		return
+		return nil
 	}
 	if *update && *updateJobsFlag {
 		if err := updateAllJobs(ctx, database, client, limiter, *workers); err != nil {
-			log.Fatal(err)
+			return err
 		}
-		return
+		return nil
 	}
 
 	pool := newCheckPool(ctx, client, limiter, database, stats, provider, *workers)
@@ -201,12 +223,9 @@ func main() {
 		stats.print(time.Since(started))
 	}
 	if runErr != nil {
-		if benchmarkClean != nil {
-			benchmarkClean()
-			benchmarkClean = nil
-		}
-		log.Fatal(runErr)
+		return runErr
 	}
+	return nil
 }
 
 // bruteCount returns how many candidates brute force would generate.

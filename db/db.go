@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 	_ "turso.tech/database/tursogo"
 )
 
@@ -30,9 +31,29 @@ func New(ctx context.Context, path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	return newWithConnection(ctx, conn)
+}
+
+// NewRemote connects directly to a remote Turso database without a local replica.
+func NewRemote(ctx context.Context, remoteURL, authToken string) (*DB, error) {
+	connector, err := libsql.NewConnector(remoteURL, libsql.WithAuthToken(authToken))
+	if err != nil {
+		return nil, fmt.Errorf("create remote database connector: %w", err)
+	}
+	return newWithConnection(ctx, sql.OpenDB(connector))
+}
+
+func newWithConnection(ctx context.Context, conn *sql.DB) (database *DB, err error) {
+	initialized := false
+	defer func() {
+		if !initialized {
+			if closeErr := conn.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close database after initialization failure: %w", closeErr))
+			}
+		}
+	}()
 
 	if err := conn.PingContext(ctx); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("connect to database: %w", err)
 	}
 
@@ -105,13 +126,11 @@ func New(ctx context.Context, path string) (*DB, error) {
 	`
 
 	if _, err := conn.ExecContext(ctx, schema); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("initialize schema: %w", err)
 	}
 
-	database := &DB{conn: conn}
+	database = &DB{conn: conn}
 	if err := database.migrateLegacySchema(ctx); err != nil {
-		conn.Close()
 		return nil, err
 	}
 	if _, err := conn.ExecContext(ctx, `
@@ -122,9 +141,9 @@ func New(ctx context.Context, path string) (*DB, error) {
 		CREATE INDEX IF NOT EXISTS indexed_jobs_employment_idx ON indexed_jobs(employment_type);
 		CREATE INDEX IF NOT EXISTS indexed_jobs_workplace_idx ON indexed_jobs(workplace_type);
 	`); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("create job search indexes: %w", err)
 	}
+	initialized = true
 	return database, nil
 }
 

@@ -36,9 +36,6 @@ func loadDatabaseConfig(envPath string) (databaseConfig, error) {
 			config.localPath = "local.db"
 		}
 	case "remote":
-		if config.localPath == "" {
-			config.localPath = "local.db"
-		}
 		if config.tursoURL == "" {
 			return databaseConfig{}, errors.New("TURSO_DATABASE_URL is required when DB_MODE=remote")
 		}

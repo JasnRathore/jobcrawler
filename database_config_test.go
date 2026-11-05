@@ -64,7 +64,7 @@ func TestLoadDatabaseConfigRequiresRemoteCredentials(t *testing.T) {
 	}
 }
 
-func TestLoadDatabaseConfigRemoteDefaultsLocalPath(t *testing.T) {
+func TestLoadDatabaseConfigRemoteDoesNotChooseLocalPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	if err := os.WriteFile(path, []byte("DB_MODE=remote\nTURSO_DATABASE_URL=libsql://example.turso.io\nTURSO_AUTH_TOKEN=test-token\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -74,8 +74,8 @@ func TestLoadDatabaseConfigRemoteDefaultsLocalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.localPath != "local.db" {
-		t.Fatalf("remote config local path = %q, want default local.db for explicit sync", config.localPath)
+	if config.localPath != "" {
+		t.Fatalf("remote config local path = %q, want empty", config.localPath)
 	}
 }
 

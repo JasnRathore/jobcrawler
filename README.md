@@ -9,8 +9,25 @@ those listings.
 - Go 1.27.3 or later
 - Network access to the selected job-board provider
 
-Run commands from the repository directory. The program creates and uses
-`local.db` in the current working directory.
+Run commands from the repository directory. Local mode uses `local.db` in the
+current working directory by default.
+
+## Database configuration
+
+The crawler reads database settings from environment variables, or from `.env`
+in the current directory when those variables are not already set:
+
+```dotenv
+DB_MODE=remote
+TURSO_DATABASE_URL=libsql://your-database-your-org.turso.io
+TURSO_AUTH_TOKEN=your-turso-auth-token
+```
+
+In remote mode, the crawler connects directly to Turso; each database
+operation is sent to the remote database, with no local replica or sync step.
+No `local.db` file is opened, so another process using a local database file
+will not cause a file-lock conflict. In local mode, `LOCAL_DB_PATH` selects the
+SQLite database file and defaults to `local.db`.
 
 ## Quick start
 
@@ -172,11 +189,11 @@ default for other discovery modes.
 
 ## Data and recovery
 
-The database is named `local.db` in the current directory. It stores discovered
-companies, brute-force checkpoints, indexed jobs, and bookmarks. The crawler
-creates/migrates its schema on startup. Back up `local.db` while the crawler is
-stopped; if SQLite sidecar files such as `local.db-wal` or `local.db-shm` exist,
-preserve them together with the database.
+The database stores discovered companies, brute-force checkpoints, indexed
+jobs, and bookmarks. The crawler creates/migrates its schema on startup. In
+local mode, back up `LOCAL_DB_PATH` while the crawler is stopped; if SQLite
+sidecar files such as `local.db-wal` or `local.db-shm` exist, preserve them
+together with the database. Remote mode uses Turso as described above.
 
 ## Development
 
