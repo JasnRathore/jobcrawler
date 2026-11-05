@@ -160,6 +160,29 @@ Benchmark mode uses a temporary database and prints request, retry, status,
 latency, and company-check statistics when the run finishes. It cannot be
 combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 
+## Curate a proxy pool
+
+Collecting and crawling are separate passes. Build a curated list first:
+collect mode merges the sources, probes every candidate several rounds
+through your chosen provider's endpoint, and saves only the reachable
+ones. Files and `http(s)` URLs mix freely, and nothing touches the
+database:
+
+```powershell
+go run . --collect-proxies .\ips.json --proxy-sources .\free-proxy-list.json,"https://proxylist.geonode.com/api/proxy-list?speed=fast&page=1&limit=500&sort_by=responseTime&sort_type=asc" --ashbyhq
+```
+
+Then crawl against the small curated file — startup probe is near
+instant because it only re-validates proven peers:
+
+```powershell
+go run . --brute --workers 64 --min 3 --max 3 --ashbyhq --rps 150 --proxies .\ips.json
+```
+
+Rerun collect mode whenever the list feels stale, and keep it fresh
+during crawl runs with `--proxy-save .\ips.json` (overwrites `ips.json`
+with the peers that survived that run). See `DESIGN.md` for details.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -183,6 +206,10 @@ combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 | `--proxy-failures N` | `5` | Evict a proxy after this many consecutive failures |
 | `--proxy-probe-timeout DURATION` | `3s` | Startup health-probe timeout per proxy |
 | `--proxy-save FILE` | Off | Save proxies that survived the run (never evicted) to `FILE` with request stats, sorted by successes so the file can be fed back to `--proxies` |
+| `--collect-proxies FILE` | Off | Collect mode: probe candidates from the sources and write proven-good proxies to `FILE` instead of crawling |
+| `--proxy-sources LIST` | Off | Comma-separated proxy list files or URLs to feed `--collect-proxies` (defaults to `--proxies`) |
+| `--collect-iterations N` | `2` | Probe rounds per candidate in collect mode; more rounds keep only stable proxies |
+| `--collect-unique-hosts` | Off | Keep only the best proxy per host in collect mode |
 | `--bench` | Off | Benchmark discovery without changing `local.db` |
 | `--update --jobs` | Off | Refresh indexed jobs for every discovered company |
 | `--browse` | Off | Start the local job browser |

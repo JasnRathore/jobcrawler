@@ -560,6 +560,147 @@ func TestLoadProxyPoolFailsWithoutAliveProxy(t *testing.T) {
 	}
 }
 
+func probeResponse() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusNotFound,
+		Status:     "404 Not Found",
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+}
+
+func TestCurateProxiesKeepsAnsweringCandidates(t *testing.T) {
+	good := &collectCandidate{
+		entry:  proxyListEntry{Proxy: "http://good:80", Protocol: "http", Alive: true, Anonymity: "elite"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return probeResponse(), nil })},
+	}
+	calls := 0
+	flaky := &collectCandidate{
+		entry: proxyListEntry{Proxy: "http://flaky:80", Protocol: "http", Alive: true, Anonymity: "elite"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("connection reset")
+			}
+			return probeResponse(), nil
+		})},
+	}
+	dead := &collectCandidate{
+		entry:  proxyListEntry{Proxy: "http://dead:80", Protocol: "http", Alive: true, Anonymity: "elite"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("tunnel refused") })},
+	}
+
+	saved, err := curateProxies(context.Background(), []*collectCandidate{good, flaky, dead}, 2, time.Second, "https://boards.example/probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 2 {
+		t.Fatalf("curated %d entries, want 2", len(saved))
+	}
+	if saved[0].Proxy != "http://good:80" || saved[0].Successes != 2 || saved[0].Requests != 2 || saved[0].Failures != 0 {
+		t.Fatalf("first entry: %+v", saved[0])
+	}
+	if saved[1].Proxy != "http://flaky:80" || saved[1].Successes != 1 || saved[1].Failures != 1 || saved[1].Requests != 2 {
+		t.Fatalf("second entry: %+v", saved[1])
+	}
+	if saved[0].ResponseMs < 0 {
+		t.Fatalf("response_ms must not be negative: %+v", saved[0])
+	}
+	if saved[0].LastUsed == "" {
+		t.Fatal("last_used missing")
+	}
+
+	none := []*collectCandidate{{
+		entry:  proxyListEntry{Proxy: "http://dead:80", Protocol: "http", Alive: true},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("dead") })},
+	}}
+	if _, err := curateProxies(context.Background(), none, 2, time.Second, "https://boards.example/probe"); err == nil {
+		t.Fatal("expected an error when no candidate ever answers")
+	}
+}
+
+func TestEligibleProxyEntriesFiltersAndCollapsesHosts(t *testing.T) {
+	entries := []proxyListEntry{
+		{Proxy: "http://45.74.31.41:7002", Protocol: "http", Alive: true, Anonymity: "elite", Uptime: 5},
+		{Proxy: "http://45.74.31.41:7190", Protocol: "http", Alive: true, Anonymity: "elite", Uptime: 9},
+		{Proxy: "socks5://2.2.2.2:1080", Protocol: "socks5", Alive: true, Anonymity: "elite", Uptime: 1},
+		{Proxy: "http://3.3.3.3:8080", Protocol: "http", Alive: false, Anonymity: "elite", Uptime: 9},
+		{Proxy: "http://4.4.4.4:8080", Protocol: "http", Alive: true, Anonymity: "transparent", Uptime: 9},
+		{Proxy: "http://5.5.5.5:8080", Protocol: "ftp", Alive: true, Anonymity: "elite", Uptime: 9},
+		{Proxy: "http://45.74.31.41:7002", Protocol: "http", Alive: true, Anonymity: "elite", Uptime: 7}, // duplicate URL
+	}
+
+	byURL := eligibleProxyEntries(entries, false)
+	if len(byURL) != 3 {
+		t.Fatalf("by-URL filtering kept %d entries, want 3: %+v", len(byURL), byURL)
+	}
+	// The duplicate URL (uptime 7) is dropped before sorting, leaving 9, 5, 1.
+	if byURL[0].Uptime != 9 || byURL[1].Uptime != 5 || byURL[2].Uptime != 1 {
+		t.Fatalf("by-URL order wrong: %+v", byURL)
+	}
+
+	byHost := eligibleProxyEntries(entries, true)
+	if len(byHost) != 2 {
+		t.Fatalf("by-host filtering kept %d entries, want 2: %+v", len(byHost), byHost)
+	}
+	if byHost[0].Proxy != "http://45.74.31.41:7190" {
+		t.Fatalf("by-host kept %s, want the highest-uptime port", byHost[0].Proxy)
+	}
+	if byHost[1].Proxy != "socks5://2.2.2.2:1080" {
+		t.Fatalf("by-host kept %s, want the other host", byHost[1].Proxy)
+	}
+}
+
+func TestCollectProxiesWritesCuratedFile(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	targetHost := strings.TrimPrefix(target.URL, "http://")
+
+	listPath := filepath.Join(t.TempDir(), "sources.json")
+	entries := "[" +
+		fmt.Sprintf(`{"proxy":"socks5://%s","protocol":"socks5","alive":true,"anonymity":"elite","uptime":5},`, targetHost) +
+		fmt.Sprintf(`{"proxy":"http://%s","protocol":"http","alive":true,"anonymity":"elite","uptime":3},`, targetHost) +
+		`{"proxy":"http://127.0.0.1:1","protocol":"http","alive":true,"anonymity":"elite","uptime":99}` +
+		"]"
+	if err := os.WriteFile(listPath, []byte(entries), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "ips.json")
+
+	if err := collectProxies(context.Background(), output, []string{listPath}, 2, false, time.Second, 5*time.Second, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeProxyList(data)
+	if err != nil {
+		t.Fatalf("curated file is not loadable: %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("curated %d entries, want 2 (unreachable candidate dropped)", len(decoded))
+	}
+	var saved []proxySaveEntry
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	// Equal successes hand ordering to the latency tie-break, which is
+	// intentionally nondeterministic; accept either order.
+	if !((saved[0].Proxy == "http://"+targetHost && saved[1].Proxy == "socks5://"+targetHost) ||
+		(saved[0].Proxy == "socks5://"+targetHost && saved[1].Proxy == "http://"+targetHost)) {
+		t.Fatalf("saved proxies: %s and %s, want the two target entries", saved[0].Proxy, saved[1].Proxy)
+	}
+	for _, entry := range saved {
+		if entry.Successes != 2 {
+			t.Fatalf("probe rounds not counted: %+v", entry)
+		}
+	}
+}
+
 func TestProbePeerTunnelCheckDropsDeadTunnels(t *testing.T) {
 	alivePeer := &proxyPeer{raw: "http://alive:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{

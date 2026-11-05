@@ -131,6 +131,28 @@ the crawl returns (including Ctrl+C unwinding), and only surviving peers
 are saved — a peer evicted after `--proxy-failures` consecutive failures is
 excluded even if it had earlier successes.
 
+### Collect mode (`--collect-proxies`)
+
+Curation and crawling are separate passes. `--collect-proxies FILE`
+runs database-free: it merges every source (`--proxy-sources` wins,
+otherwise `--proxies`; each element is a file path or an http(s) URL),
+filters through `eligibleProxyEntries` — optionally collapsing to the
+best entry per host with `--collect-unique-hosts` — then probes every
+candidate `--collect-iterations` times (default 2) through the selected
+provider's endpoint with the shared 64-way probe concurrency. Everything
+that answered at least once is written to `FILE` in the same schema as
+`--proxy-save`, with `response_ms` carrying the average measured probe
+latency, ordered by successes descending, then response time, then URL.
+A run with zero survivors is an error; a source that fails to load is
+skipped with a log when other sources remain. Crawl afterwards from the
+curated file: startup only re-validates the proven peers, so it is fast,
+and `--proxy-save` during crawl sweeps keeps the file current.
+
+Collect mode never touches the database, the request limiter, or the
+crawl pipeline; sources and output reuse the decode/eligibility/probe/
+save machinery of the regular pool, so Geonode URLs, wrapped lists and
+saved pool files all work as sources.
+
 ## Flags
 
 | Flag | Default | Meaning |
@@ -140,6 +162,10 @@ excluded even if it had earlier successes.
 | `--proxy-failures` | `5` | Consecutive failures before a proxy is evicted |
 | `--proxy-probe-timeout` | `3s` | Startup health-probe timeout per proxy |
 | `--proxy-save` | `` | Path to write surviving proxies (never evicted) with request stats, in a schema `--proxies` can re-load |
+| `--collect-proxies` | `` | Curation mode: probe every candidate from the sources and write survivors to this JSON file instead of crawling |
+| `--proxy-sources` | `` | Comma-separated proxy list files or URLs to feed `--collect-proxies` (defaults to `--proxies`) |
+| `--collect-iterations` | `2` | Probe rounds per candidate in collect mode; more rounds keep only stable proxies |
+| `--collect-unique-hosts` | `off` | Keep only the best proxy per host in collect mode |
 | `--rps` | `50` | Global aggregate rate cap (unchanged; applies in pool mode too) |
 | `--cooldown` | `2m` | Host-wide pause after 429 in direct mode; caps per-proxy cooldowns in pool mode |
 
@@ -161,8 +187,10 @@ cancellation at the state-machine level, plus list filtering/ordering
 (bare array and object-wrapped lists, the Geonode record mapping), the
 tunnel-vs-TCP probe decision, URL fetch and decode error paths, the
 `--proxy-save` stats counters and save/re-decode round trip (evicted
-peers excluded, successes-descending ordering), and a `429 → rotate → 200`
-integration test through `fetchProviderResponse`. Existing tests keep
+peers excluded, successes-descending ordering), the collect-mode
+curation rounds (stable, flaky and dead candidates; per-host collapse;
+full file-to-file flow) and a `429 → rotate → 200` integration test
+through `fetchProviderResponse`. Existing tests keep
 passing with a nil pool, which pins down the `--proxies off` behavior.
 
 Failure diagnostics: when attempts are exhausted the error carries the

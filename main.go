@@ -68,6 +68,10 @@ func run() (returnErr error) {
 	proxyFailures := flag.Int("proxy-failures", 5, "evict a proxy after this many consecutive failures")
 	proxyProbeTimeout := flag.Duration("proxy-probe-timeout", 3*time.Second, "startup health probe timeout per proxy")
 	proxySavePath := flag.String("proxy-save", "", "write surviving proxies with request stats to this JSON file (for example ips.json)")
+	collectPath := flag.String("collect-proxies", "", "collect and validate proxies from --proxy-sources (or --proxies) and write survivors to this JSON file instead of crawling")
+	proxySources := flag.String("proxy-sources", "", "comma-separated proxy list files or URLs to feed --collect-proxies")
+	collectIterations := flag.Int("collect-iterations", 2, "probe rounds per proxy in --collect-proxies mode; more rounds keep only stable proxies")
+	collectUniqueHosts := flag.Bool("collect-unique-hosts", false, "keep only the best proxy per host in --collect-proxies mode")
 	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
 	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
 	flag.Parse()
@@ -134,9 +138,30 @@ func run() (returnErr error) {
 		log.Printf("warning: brute force up to length %d means %d candidates",
 			maxSlugLength, bruteCount(minSlugLength, maxSlugLength))
 	}
+	if *collectPath != "" {
+		if *brute || *words != "" || *bench || *update || *browse || *resume {
+			return errors.New("--collect-proxies cannot be combined with --brute, --words, --bench, --update/--jobs, --browse, or --resume")
+		}
+		if *collectIterations < 1 {
+			return errors.New("collect iterations must be at least 1")
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	// Collect mode curation runs database-free: fetch the sources,
+	// probe against the provider endpoint, and write the curated file.
+	if *collectPath != "" {
+		if *proxySavePath != "" {
+			log.Printf("--proxy-save has no effect in --collect-proxies mode; the output is --collect-proxies")
+		}
+		sources, sourcesErr := buildProxySources(*proxySources, *proxiesPath)
+		if sourcesErr != nil {
+			return sourcesErr
+		}
+		return collectProxies(ctx, *collectPath, sources, *collectIterations, *collectUniqueHosts, *proxyProbeTimeout, *requestTimeout, providerProbeURL(provider))
+	}
 
 	var (
 		database       *db.DB
@@ -195,12 +220,7 @@ func run() (returnErr error) {
 		// Validate proxies against the provider this run will actually use:
 		// any HTTP response proves the tunnel works; a bare TCP dial would
 		// admit proxies that open connections but never forward CONNECT.
-		probeURL := ""
-		if probeProvider, providerErr := getProvider(provider); providerErr == nil {
-			if endpoints := probeProvider.CompanyEndpoints("probe"); len(endpoints) > 0 {
-				probeURL = endpoints[0]
-			}
-		}
+		probeURL := providerProbeURL(provider)
 		proxies, err = loadProxyPool(ctx, *proxiesPath, proxyPoolConfig{
 			minReuseGap:     *proxyReuseGap,
 			maxFailures:     *proxyFailures,
@@ -335,6 +355,43 @@ func newClient(workers int, timeout time.Duration) *http.Client {
 		TLSHandshakeTimeout: 3 * time.Second,
 	}
 	return &http.Client{Transport: tr, Timeout: timeout}
+}
+
+// providerProbeURL picks the endpoint a provider serves any company from;
+// startup validation sends one GET per candidate proxy there, so any HTTP
+// status proves the proxy's tunnel reaches the provider.
+func providerProbeURL(provider string) string {
+	p, err := getProvider(provider)
+	if err != nil {
+		return ""
+	}
+	if endpoints := p.CompanyEndpoints("probe"); len(endpoints) > 0 {
+		return endpoints[0]
+	}
+	return ""
+}
+
+// buildProxySources resolves the candidate sources for --collect-proxies:
+// the --proxy-sources list wins, otherwise --proxies is used. Each
+// element is a file path or an http(s) URL.
+func buildProxySources(proxySources, proxiesPath string) ([]string, error) {
+	raw := proxySources
+	if raw == "" {
+		if proxiesPath == "off" {
+			return nil, errors.New("--collect-proxies needs --proxy-sources or --proxies pointing at candidate lists")
+		}
+		raw = proxiesPath
+	}
+	sources := make([]string, 0)
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			sources = append(sources, part)
+		}
+	}
+	if len(sources) == 0 {
+		return nil, errors.New("proxy sources must be comma-separated files or URLs")
+	}
+	return sources, nil
 }
 
 func feedWordlist(path string, emit func(string) bool) error {

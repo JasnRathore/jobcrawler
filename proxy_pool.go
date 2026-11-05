@@ -237,6 +237,51 @@ func fetchProxyListEntries(ctx context.Context, source string, timeout time.Dura
 	return entries, nil
 }
 
+// eligibleProxyEntries filters the entries worth validating: alive, http
+// or socks5, without a downgraded anonymity, deduplicated by proxy URL —
+// or by host when uniqueHosts collapses multi-port providers to their
+// best entry — and returns them ordered by uptime (best candidates
+// first). Entries whose URL does not parse are dropped.
+func eligibleProxyEntries(entries []proxyListEntry, uniqueHosts bool) []proxyListEntry {
+	kept := make([]proxyListEntry, 0, len(entries))
+	seen := make(map[string]struct{})
+	best := make(map[string]int) // hostname -> index into kept
+	for _, entry := range entries {
+		if !entry.Alive {
+			continue
+		}
+		if entry.Protocol != "http" && entry.Protocol != "socks5" {
+			continue
+		}
+		if entry.Anonymity != "" && entry.Anonymity != "elite" {
+			continue
+		}
+		if _, ok := seen[entry.Proxy]; ok {
+			continue
+		}
+		seen[entry.Proxy] = struct{}{}
+		proxyURL, err := url.Parse(entry.Proxy)
+		if err != nil {
+			continue
+		}
+		if uniqueHosts {
+			host := proxyURL.Hostname()
+			if index, ok := best[host]; ok {
+				if entry.Uptime > kept[index].Uptime {
+					kept[index] = entry
+				}
+				continue
+			}
+			best[host] = len(kept)
+		}
+		kept = append(kept, entry)
+	}
+	sort.SliceStable(kept, func(i, j int) bool {
+		return kept[i].Uptime > kept[j].Uptime
+	})
+	return kept
+}
+
 // loadProxyPool reads a proxy list file, keeps alive elite http/socks5
 // entries ordered by uptime (best first), validates each peer, and keeps
 // only peers that answered within probeTimeout. With a non-empty probeURL
@@ -266,45 +311,16 @@ func loadProxyPool(
 		return nil, err
 	}
 
-	type candidate struct {
-		peer   *proxyPeer
-		uptime float64
-	}
-	candidates := make([]candidate, 0, len(entries))
-	seen := make(map[string]struct{})
-	for _, entry := range entries {
-		if !entry.Alive {
-			continue
-		}
-		if entry.Protocol != "http" && entry.Protocol != "socks5" {
-			continue
-		}
-		if entry.Anonymity != "" && entry.Anonymity != "elite" {
-			continue
-		}
-		if _, ok := seen[entry.Proxy]; ok {
-			continue
-		}
-		seen[entry.Proxy] = struct{}{}
+	ordered := make([]*proxyPeer, 0, len(entries))
+	for _, entry := range eligibleProxyEntries(entries, false) {
 		proxyURL, err := url.Parse(entry.Proxy)
 		if err != nil {
 			continue
 		}
-		candidates = append(candidates, candidate{
-			peer: &proxyPeer{
-				raw:    entry.Proxy,
-				client: newPeerClient(proxyURL, requestTimeout),
-			},
-			uptime: entry.Uptime,
+		ordered = append(ordered, &proxyPeer{
+			raw:    entry.Proxy,
+			client: newPeerClient(proxyURL, requestTimeout),
 		})
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].uptime > candidates[j].uptime
-	})
-
-	ordered := make([]*proxyPeer, 0, len(candidates))
-	for _, candidate := range candidates {
-		ordered = append(ordered, candidate.peer)
 	}
 
 	probed := probeProxyPeers(ctx, ordered, probeTimeout, probeURL)
@@ -537,15 +553,16 @@ func (p *proxyPool) healthyPeers() int {
 }
 
 type proxySaveEntry struct {
-	Proxy     string  `json:"proxy"`
-	Protocol  string  `json:"protocol"`
-	Anonymity string  `json:"anonymity"`
-	Alive     bool    `json:"alive"`
-	Uptime    float64 `json:"uptime"`
-	Requests  int     `json:"requests"`
-	Successes int     `json:"successes"`
-	Failures  int     `json:"failures"`
-	LastUsed  string  `json:"last_used,omitempty"`
+	Proxy      string  `json:"proxy"`
+	Protocol   string  `json:"protocol"`
+	Anonymity  string  `json:"anonymity"`
+	Alive      bool    `json:"alive"`
+	Uptime     float64 `json:"uptime"`
+	Requests   int     `json:"requests"`
+	Successes  int     `json:"successes"`
+	Failures   int     `json:"failures"`
+	ResponseMs float64 `json:"response_ms,omitempty"`
+	LastUsed   string  `json:"last_used,omitempty"`
 }
 
 // snapshot returns the surviving (never evicted) peers as save entries
@@ -596,20 +613,30 @@ func (p *proxyPool) save(path string) (int, error) {
 	p.saveMu.Lock()
 	defer p.saveMu.Unlock()
 	entries := p.snapshot()
+	if err := writeProxyList(path, entries); err != nil {
+		return 0, err
+	}
+	return len(entries), nil
+}
+
+// writeProxyList serializes the entries as a loadable proxy list file,
+// through a temp-file rename so a crash mid-write never corrupts the
+// previous list.
+func writeProxyList(path string, entries []proxySaveEntry) error {
 	data, err := json.MarshalIndent(entries, "", " ")
 	if err != nil {
-		return 0, err
+		return err
 	}
 	data = append(data, '\n')
 	temp := path + ".tmp"
 	if err := os.WriteFile(temp, data, 0o644); err != nil {
-		return 0, err
+		return err
 	}
 	if err := os.Rename(temp, path); err != nil {
 		os.Remove(temp)
-		return 0, err
+		return err
 	}
-	return len(entries), nil
+	return nil
 }
 
 // proxySaveInterval is how often --proxy-save rewrites the list during a
@@ -643,6 +670,207 @@ func flushProxyList(ctx context.Context, pool *proxyPool, path string) {
 			saveProxyList(pool, path)
 		}
 	}
+}
+
+// collectCandidate is one proxy under consideration in collect mode with
+// the client used for probe rounds and the stats observed so far.
+type collectCandidate struct {
+	entry     proxyListEntry
+	client    *http.Client
+	successes int
+	failures  int
+	latencyMS float64
+	latencyN  int
+}
+
+// probe once through the candidate. A non-empty probeURL sends a GET
+// through the proxy — any HTTP status proves the tunnel — otherwise a
+// TCP dial is timed instead. Returns success and the elapsed duration.
+func (c *collectCandidate) probe(ctx context.Context, probeURL string, timeout time.Duration) (bool, time.Duration) {
+	if probeURL == "" {
+		start := time.Now()
+		err := dialProxyPeer(ctx, &net.Dialer{Timeout: timeout}, c.entry.Proxy)
+		return err == nil, time.Since(start)
+	}
+	client := &http.Client{Transport: c.client.Transport, Timeout: timeout}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return false, 0
+	}
+	start := time.Now()
+	res, err := client.Do(req)
+	elapsed := time.Since(start)
+	if err != nil {
+		return false, elapsed
+	}
+	io.Copy(io.Discard, io.LimitReader(res.Body, 512))
+	res.Body.Close()
+	return true, elapsed
+}
+
+// collectProxies curation mode: pull candidates from every source (file
+// or http(s) URL), probe each one `iterations` times through probeURL
+// with the shared probe concurrency, drop everything that never
+// answered, and write the curated list to output. With uniqueHosts only
+// the best entry per host survives, which saves probes when one provider
+// exposes the same egress IP on many ports.
+func collectProxies(
+	ctx context.Context,
+	output string,
+	sources []string,
+	iterations int,
+	uniqueHosts bool,
+	probeTimeout time.Duration,
+	requestTimeout time.Duration,
+	probeURL string,
+) error {
+	if probeTimeout <= 0 {
+		return errors.New("proxy probe timeout must be greater than 0")
+	}
+	entries := make([]proxyListEntry, 0)
+	for _, source := range sources {
+		var sourceEntries []proxyListEntry
+		var err error
+		if isProxyListURL(source) {
+			sourceEntries, err = fetchProxyListEntries(ctx, source, requestTimeout)
+		} else {
+			sourceEntries, err = loadProxyListFile(source)
+		}
+		if err != nil {
+			if len(sources) > 1 {
+				log.Printf("skipping proxy source %s: %v", source, err)
+				continue
+			}
+			return err
+		}
+		log.Printf("loaded %d proxy candidates from %s", len(sourceEntries), source)
+		entries = append(entries, sourceEntries...)
+	}
+	if len(entries) == 0 {
+		return errors.New("no proxy candidates found in the given sources")
+	}
+
+	candidates := make([]*collectCandidate, 0, len(entries))
+	for _, entry := range eligibleProxyEntries(entries, uniqueHosts) {
+		proxyURL, err := url.Parse(entry.Proxy)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, &collectCandidate{
+			entry:  entry,
+			client: newPeerClient(proxyURL, probeTimeout),
+		})
+	}
+	if len(candidates) == 0 {
+		return errors.New("no eligible proxy candidates after filtering the given sources")
+	}
+
+	curated, err := curateProxies(ctx, candidates, iterations, probeTimeout, probeURL)
+	if err != nil {
+		return err
+	}
+	if err := writeProxyList(output, curated); err != nil {
+		return fmt.Errorf("write proxy list %s: %w", output, err)
+	}
+	log.Printf("collected %d proxies from %d candidate(s) after %d probe round(s) -> %s",
+		len(curated), len(candidates), iterations, output)
+	return nil
+}
+
+// curateProxies runs the probe rounds over the candidates, keeps anything
+// that answered at least once, and returns save entries ordered by
+// successes descending, then measured response time, then proxy URL.
+// Candidates are mutated, so callers must not share them concurrently.
+func curateProxies(ctx context.Context, candidates []*collectCandidate, iterations int, probeTimeout time.Duration, probeURL string) ([]proxySaveEntry, error) {
+	for round := 1; round <= iterations; round++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		collectSweep(ctx, candidates, probeTimeout, probeURL)
+		answered := 0
+		for _, candidate := range candidates {
+			if candidate.successes > 0 {
+				answered++
+			}
+		}
+		log.Printf("probe round %d/%d done: %d/%d answered so far", round, iterations, answered, len(candidates))
+	}
+
+	survivors := make([]*collectCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.successes > 0 {
+			survivors = append(survivors, candidate)
+		}
+	}
+	if len(survivors) == 0 {
+		return nil, fmt.Errorf("no proxy answered any of %d probe round(s)", iterations)
+	}
+	sort.SliceStable(survivors, func(i, j int) bool {
+		a, b := survivors[i], survivors[j]
+		if a.successes != b.successes {
+			return a.successes > b.successes
+		}
+		if a.averageLatency() != b.averageLatency() {
+			return a.averageLatency() < b.averageLatency()
+		}
+		return a.entry.Proxy < b.entry.Proxy
+	})
+
+	saved := make([]proxySaveEntry, 0, len(survivors))
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, candidate := range survivors {
+		if candidate.latencyN > 0 {
+			candidate.latencyMS = candidate.latencyMS / float64(candidate.latencyN)
+		}
+		saved = append(saved, proxySaveEntry{
+			Proxy:      candidate.entry.Proxy,
+			Protocol:   candidate.entry.Protocol,
+			Anonymity:  candidate.entry.Anonymity,
+			Alive:      true,
+			Uptime:     float64(candidate.successes),
+			Requests:   candidate.successes + candidate.failures,
+			Successes:  candidate.successes,
+			Failures:   candidate.failures,
+			ResponseMs: candidate.latencyMS,
+			LastUsed:   now,
+		})
+	}
+	return saved, nil
+}
+
+// collectSweep probes every candidate once, concurrently.
+func collectSweep(ctx context.Context, candidates []*collectCandidate, probeTimeout time.Duration, probeURL string) {
+	jobs := make(chan *collectCandidate)
+	var wg sync.WaitGroup
+	for i := 0; i < proxyProbeConcurrency && i < len(candidates); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for candidate := range jobs {
+				ok, elapsed := candidate.probe(ctx, probeURL, probeTimeout)
+				if ok {
+					candidate.successes++
+					candidate.latencyMS += float64(elapsed) / float64(time.Millisecond)
+					candidate.latencyN++
+				} else {
+					candidate.failures++
+				}
+			}
+		}()
+	}
+	for _, candidate := range candidates {
+		jobs <- candidate
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+// averageLatency returns the mean probe latency in milliseconds.
+func (c *collectCandidate) averageLatency() float64 {
+	if c.latencyN == 0 {
+		return 0
+	}
+	return c.latencyMS / float64(c.latencyN)
 }
 
 // progressNote summarizes pool health for the brute-force progress line,
