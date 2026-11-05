@@ -67,6 +67,7 @@ func run() (returnErr error) {
 	proxyReuseGap := flag.Duration("proxy-reuse-min", 0, "minimum gap before a released proxy is leased again (for example 30s or 5m)")
 	proxyFailures := flag.Int("proxy-failures", 5, "evict a proxy after this many consecutive failures")
 	proxyProbeTimeout := flag.Duration("proxy-probe-timeout", 3*time.Second, "startup health probe timeout per proxy")
+	proxySavePath := flag.String("proxy-save", "", "write surviving proxies with request stats to this JSON file (for example ips.json)")
 	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
 	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
 	flag.Parse()
@@ -187,6 +188,9 @@ func run() (returnErr error) {
 		if *proxiesPath != "off" {
 			log.Printf("--proxies has no effect with --browse")
 		}
+		if *proxySavePath != "" {
+			log.Printf("--proxy-save has no effect with --browse")
+		}
 	} else if *proxiesPath != "off" {
 		// Validate proxies against the provider this run will actually use:
 		// any HTTP response proves the tunnel works; a bare TCP dial would
@@ -206,8 +210,20 @@ func run() (returnErr error) {
 		if err != nil {
 			return err
 		}
-	} else if *proxyReuseGap != 0 {
-		log.Printf("--proxy-reuse-min has no effect without --proxies")
+		if *proxySavePath != "" {
+			// Periodic flush catches a hard crash; the deferred save
+			// covers both normal completion and Ctrl+C (ctx cancellation
+			// unwinds this function, so the defer runs before exit).
+			defer saveProxyList(proxies, *proxySavePath)
+			go flushProxyList(ctx, proxies, *proxySavePath)
+		}
+	} else {
+		if *proxySavePath != "" {
+			log.Printf("--proxy-save has no effect without --proxies")
+		}
+		if *proxyReuseGap != 0 {
+			log.Printf("--proxy-reuse-min has no effect without --proxies")
+		}
 	}
 	var stats *benchmarkStats
 	if *bench {

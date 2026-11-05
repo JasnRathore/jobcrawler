@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -312,6 +313,115 @@ func TestLoadProxyPoolFiltersAndKeepsUptimeOrder(t *testing.T) {
 	}
 	if pool.peers[1].raw != server.URL {
 		t.Fatalf("second peer = %s, want the remaining survivor %s", pool.peers[1].raw, server.URL)
+	}
+}
+
+func TestReleaseTracksPeerStats(t *testing.T) {
+	pool := newTestPool(freeConfig(), "http://a:80")
+	peer := pool.peers[0]
+	pool.release(peer, proxyOutcomeOK, 0)
+	pool.release(peer, proxyOutcomeOK, 0)
+	pool.release(peer, proxyOutcomeRateLimited, time.Second)
+	pool.release(peer, proxyOutcomeFailed, 0)
+
+	entries := pool.snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("snapshot has %d entries, want 1", len(entries))
+	}
+	entry := entries[0]
+	if entry.Successes != 2 || entry.Failures != 2 || entry.Requests != 4 {
+		t.Fatalf("stats: successes=%d failures=%d requests=%d, want 2/2/4", entry.Successes, entry.Failures, entry.Requests)
+	}
+	if entry.LastUsed == "" {
+		t.Fatal("last_used missing from snapshot")
+	}
+
+	// Consecutive failures still reset on a success: two failures after
+	// one success evict, while failure,failure,success continues.
+	evictor := newTestPool(proxyPoolConfig{maxFailures: 2}, "http://x:80")
+	target := evictor.peers[0]
+	evictor.release(target, proxyOutcomeOK, 0)
+	evictor.release(target, proxyOutcomeFailed, 0)
+	if evictor.healthyPeers() != 1 {
+		t.Fatalf("healthy=%d after one failure, want 1", evictor.healthyPeers())
+	}
+	evictor.release(target, proxyOutcomeFailed, 0)
+	if evictor.healthyPeers() != 0 {
+		t.Fatalf("healthy=%d after two consecutive failures, want 0", evictor.healthyPeers())
+	}
+	if _, direct, err := evictor.acquire(context.Background()); err != nil || !direct {
+		t.Fatalf("expected direct fallback after eviction, direct=%t err=%v", direct, err)
+	}
+
+	if note := pool.progressNote(); note != ", 1/1 proxy peers healthy" {
+		t.Fatalf("progressNote = %q", note)
+	}
+	if note := (*proxyPool)(nil).progressNote(); note != "" {
+		t.Fatalf("nil pool progressNote = %q, want empty", note)
+	}
+}
+
+func TestSaveRoundTripExcludesEvictedAndOrdersBySuccesses(t *testing.T) {
+	pool := newTestPool(proxyPoolConfig{maxFailures: 2}, "http://a:80", "http://b:80", "http://c:80")
+	first, second, burned := pool.peers[0], pool.peers[1], pool.peers[2]
+
+	// second proves itself three times, first once plus a rate limit,
+	// and burned fails twice straight away and is evicted.
+	pool.release(burned, proxyOutcomeFailed, 0)
+	pool.release(burned, proxyOutcomeFailed, 0)
+	pool.release(first, proxyOutcomeOK, 0)
+	pool.release(second, proxyOutcomeOK, 0)
+	pool.release(second, proxyOutcomeOK, 0)
+	pool.release(second, proxyOutcomeOK, 0)
+	pool.release(first, proxyOutcomeRateLimited, 0)
+
+	path := filepath.Join(t.TempDir(), "ips.json")
+	saved, err := pool.save(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved != 2 {
+		t.Fatalf("saved=%d, want 2 (evicted peer excluded)", saved)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeProxyList(data)
+	if err != nil {
+		t.Fatalf("saved file is not loadable: %v", err)
+	}
+	if len(decoded) != 2 {
+		t.Fatalf("decoded %d entries, want 2", len(decoded))
+	}
+	if decoded[0].Proxy != "http://b:80" || decoded[1].Proxy != "http://a:80" {
+		t.Fatalf("order: %s before %s, want b (3 successes) before a (1)", decoded[0].Proxy, decoded[1].Proxy)
+	}
+	if decoded[0].Uptime != 3 || decoded[1].Uptime != 1 {
+		t.Fatalf("uptimes %v then %v, want 3 then 1", decoded[0].Uptime, decoded[1].Uptime)
+	}
+
+	var entries []proxySaveEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].Protocol != "http" || !entries[0].Alive || entries[0].Anonymity != "elite" {
+		t.Fatalf("entry metadata: %+v", entries[0])
+	}
+	if entries[0].Requests != 3 || entries[0].Failures != 0 {
+		t.Fatalf("second stats: %+v", entries[0])
+	}
+	if entries[1].Requests != 2 || entries[1].Successes != 1 || entries[1].Failures != 1 {
+		t.Fatalf("first stats: %+v", entries[1])
+	}
+
+	drained := newTestPool(proxyPoolConfig{maxFailures: 2}, "http://nobody:80")
+	drained.release(drained.peers[0], proxyOutcomeFailed, 0)
+	drained.release(drained.peers[0], proxyOutcomeFailed, 0)
+	drainedSaved, err := drained.save(filepath.Join(t.TempDir(), "empty.json"))
+	if err != nil || drainedSaved != 0 {
+		t.Fatalf("save with only evicted peers: saved=%d err=%v", drainedSaved, err)
 	}
 }
 

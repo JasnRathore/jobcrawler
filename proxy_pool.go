@@ -85,7 +85,9 @@ type proxyPeer struct {
 
 	inUse         bool
 	evicted       bool
-	failures      int
+	failures      int // consecutive failures, reset on success
+	successes     int // observed successful requests since pool load
+	failuresTotal int // observed transport/5xx/429 failures since pool load
 	lastUsed      time.Time
 	cooldownUntil time.Time
 }
@@ -105,6 +107,7 @@ type proxyPoolConfig struct {
 
 type proxyPool struct {
 	mu      sync.Mutex
+	saveMu  sync.Mutex // serializes save() so flushes never race
 	peers   []*proxyPeer
 	healthy int
 	cfg     proxyPoolConfig
@@ -381,8 +384,10 @@ func (p *proxyPool) release(peer *proxyPeer, outcome proxyOutcome, retryAfter ti
 	switch outcome {
 	case proxyOutcomeOK:
 		peer.failures = 0
+		peer.successes++
 	case proxyOutcomeRateLimited:
 		peer.failures++
+		peer.failuresTotal++
 		wait := retryAfter
 		if wait < p.cfg.retryAfterFloor {
 			wait = p.cfg.retryAfterFloor
@@ -397,6 +402,7 @@ func (p *proxyPool) release(peer *proxyPeer, outcome proxyOutcome, retryAfter ti
 		}
 	case proxyOutcomeFailed:
 		peer.failures++
+		peer.failuresTotal++
 	}
 	if !peer.evicted && p.cfg.maxFailures > 0 && peer.failures >= p.cfg.maxFailures {
 		peer.evicted = true
@@ -412,6 +418,132 @@ func (p *proxyPool) healthyPeers() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.healthy
+}
+
+type proxySaveEntry struct {
+	Proxy     string  `json:"proxy"`
+	Protocol  string  `json:"protocol"`
+	Anonymity string  `json:"anonymity"`
+	Alive     bool    `json:"alive"`
+	Uptime    float64 `json:"uptime"`
+	Requests  int     `json:"requests"`
+	Successes int     `json:"successes"`
+	Failures  int     `json:"failures"`
+	LastUsed  string  `json:"last_used,omitempty"`
+}
+
+// snapshot returns the surviving (never evicted) peers as save entries
+// under the pool lock, ordered by proven successes descending so the
+// next run starts with the best performers.
+func (p *proxyPool) snapshot() []proxySaveEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entries := make([]proxySaveEntry, 0, len(p.peers))
+	for _, peer := range p.peers {
+		if peer.evicted {
+			continue
+		}
+		proxyURL, err := url.Parse(peer.raw)
+		protocol := "http"
+		if err == nil && proxyURL.Scheme != "" {
+			protocol = proxyURL.Scheme
+		}
+		entries = append(entries, proxySaveEntry{
+			Proxy:     peer.raw,
+			Protocol:  protocol,
+			Anonymity: "elite",
+			Alive:     true,
+			// Reuse the source schema: the loader sorts by uptime, so
+			// observed successes rank proven peers first.
+			Uptime:    float64(peer.successes),
+			Requests:  peer.successes + peer.failuresTotal,
+			Successes: peer.successes,
+			Failures:  peer.failuresTotal,
+			LastUsed:  peer.lastUsed.Round(time.Second).UTC().Format(time.RFC3339),
+		})
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Successes != entries[j].Successes {
+			return entries[i].Successes > entries[j].Successes
+		}
+		return entries[i].Proxy < entries[j].Proxy
+	})
+	return entries
+}
+
+// save writes surviving peers to path in the same JSON shape loadProxyPool
+// accepts, sorted by observed successes, through a temp-file rename so a
+// crash mid-write cannot corrupt the previous list. Calls are serialized
+// so a periodic flush and the final save never race. Returns the number
+// of peers written.
+func (p *proxyPool) save(path string) (int, error) {
+	p.saveMu.Lock()
+	defer p.saveMu.Unlock()
+	entries := p.snapshot()
+	data, err := json.MarshalIndent(entries, "", " ")
+	if err != nil {
+		return 0, err
+	}
+	data = append(data, '\n')
+	temp := path + ".tmp"
+	if err := os.WriteFile(temp, data, 0o644); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(temp, path); err != nil {
+		os.Remove(temp)
+		return 0, err
+	}
+	return len(entries), nil
+}
+
+// proxySaveInterval is how often --proxy-save rewrites the list during a
+// long crawl; the deferred final save still runs when the crawl ends.
+const proxySaveInterval = 5 * time.Minute
+
+// saveProxyList writes surviving peers with their request stats to path.
+// Safe with a nil pool or empty path.
+func saveProxyList(pool *proxyPool, path string) {
+	if pool == nil || path == "" {
+		return
+	}
+	saved, err := pool.save(path)
+	if err != nil {
+		log.Printf("save proxy list %s: %v", path, err)
+		return
+	}
+	log.Printf("saved %d proxies with request stats to %s", saved, path)
+}
+
+// flushProxyList rewrites the save file every proxySaveInterval until the
+// context ends, so an interrupted crawl keeps the stats collected so far.
+func flushProxyList(ctx context.Context, pool *proxyPool, path string) {
+	ticker := time.NewTicker(proxySaveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			saveProxyList(pool, path)
+		}
+	}
+}
+
+// progressNote summarizes pool health for the brute-force progress line,
+// counting only peers that can still be leased. Empty without a pool.
+func (p *proxyPool) progressNote() string {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	evicted := 0
+	for _, peer := range p.peers {
+		if peer.evicted {
+			evicted++
+		}
+	}
+	return fmt.Sprintf(", %d/%d proxy peers healthy", p.healthy, len(p.peers)-evicted)
 }
 
 // warnDirectFallback logs switching to the direct connection, at most once

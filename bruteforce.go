@@ -199,8 +199,8 @@ func runBruteForce(
 			if rate > 0 {
 				eta = time.Duration(float64(remaining)/rate) * time.Second
 			}
-			log.Printf("Brute-force progress: %d/%d candidates (%.2f%%), %.0f candidates/sec, ETA %s",
-				next, total, float64(next)*100/float64(total), rate, eta.Round(time.Second))
+			log.Printf("Brute-force progress: %d/%d candidates (%.2f%%), %.0f candidates/sec, ETA %s%s",
+				next, total, float64(next)*100/float64(total), rate, eta.Round(time.Second), pool.proxies.progressNote())
 			lastProgress = now
 		}
 	}

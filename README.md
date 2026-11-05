@@ -182,6 +182,7 @@ combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 | `--proxy-reuse-min DURATION` | `0s` | Minimum gap before a released proxy may be leased again |
 | `--proxy-failures N` | `5` | Evict a proxy after this many consecutive failures |
 | `--proxy-probe-timeout DURATION` | `3s` | Startup health-probe timeout per proxy |
+| `--proxy-save FILE` | Off | Save proxies that survived the run (never evicted) to `FILE` with request stats, sorted by successes so the file can be fed back to `--proxies` |
 | `--bench` | Off | Benchmark discovery without changing `local.db` |
 | `--update --jobs` | Off | Refresh indexed jobs for every discovered company |
 | `--browse` | Off | Start the local job browser |

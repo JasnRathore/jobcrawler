@@ -101,6 +101,22 @@ Each peer gets its own `http.Transport` pinned to its proxy URL (the
 `socks5` scheme is supported by `net/http` directly), so connection pooling
 is per egress IP and the direct client remains untouched.
 
+### Saving good peers (`--proxy-save`)
+
+`--proxy-save FILE` writes every peer that was still leasable (never
+evicted) to `FILE` in the same schema `loadProxyPool` reads — a bare JSON
+array of `proxy`/`protocol`/`alive`/`anonymity`/`uptime` objects — so a
+validated list can be fed straight back via `--proxies FILE`. Each entry
+also carries the observed run stats: `requests`, `successes`, `failures`
+(transport, 5xx and 429 combined) and `last_used` (RFC 3339). The list is
+sorted by `successes` descending, and a peer's `uptime` field holds its
+success count, so re-loading the file ranks proven winners first. Writes
+are atomic (temp file + rename) and serialized: a flush every 5 minutes
+keeps the file current during long runs, a deferred final save runs when
+the crawl returns (including Ctrl+C unwinding), and only surviving peers
+are saved — a peer evicted after `--proxy-failures` consecutive failures is
+excluded even if it had earlier successes.
+
 ## Flags
 
 | Flag | Default | Meaning |
@@ -109,6 +125,7 @@ is per egress IP and the direct client remains untouched.
 | `--proxy-reuse-min` | `0` | Minimum gap before a released proxy may be leased again (on top of any cooldown) |
 | `--proxy-failures` | `5` | Consecutive failures before a proxy is evicted |
 | `--proxy-probe-timeout` | `3s` | Startup health-probe timeout per proxy |
+| `--proxy-save` | `` | Path to write surviving proxies (never evicted) with request stats, in a schema `--proxies` can re-load |
 | `--rps` | `50` | Global aggregate rate cap (unchanged; applies in pool mode too) |
 | `--cooldown` | `2m` | Host-wide pause after 429 in direct mode; caps per-proxy cooldowns in pool mode |
 
@@ -128,9 +145,10 @@ is per egress IP and the direct client remains untouched.
 `Retry-After` flooring/capping, eviction, direct fallback and context
 cancellation at the state-machine level, plus list filtering/ordering
 (bare array and object-wrapped lists), the tunnel-vs-TCP probe decision,
-and a `429 → rotate → 200` integration test through
-`fetchProviderResponse`. Existing tests keep passing with a nil pool,
-which pins down the `--proxies off` behavior.
+the `--proxy-save` stats counters and save/re-decode round trip (evicted
+peers excluded, successes-descending ordering), and a `429 → rotate → 200`
+integration test through `fetchProviderResponse`. Existing tests keep
+passing with a nil pool, which pins down the `--proxies off` behavior.
 
 Failure diagnostics: when attempts are exhausted the error carries the
 last failure cause, e.g. `fetch ashbyhq response after retries (last:
