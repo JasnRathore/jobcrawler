@@ -25,32 +25,100 @@ const proxyProbeConcurrency = 64
 // healthy peer is currently leased by another worker.
 const proxyInUsePollInterval = 5 * time.Millisecond
 
+// proxyListMaxBytes caps a downloaded proxy list to a sane size.
+const proxyListMaxBytes = 16 << 20
+
+// geonodeProxyEntry mirrors the proxylist.geonode.com API record. The
+// port is a string there, but json.Number accepts quoted and unquoted
+// numbers alike; responseTime is milliseconds.
+type geonodeProxyEntry struct {
+	IP        string      `json:"ip"`
+	Port      json.Number `json:"port"`
+	Protocols []string    `json:"protocols"`
+	Anonymity string      `json:"anonymityLevel"`
+	Latency   float64     `json:"responseTime"`
+	UpTime    float64     `json:"upTime"`
+}
+
+// toEntries maps one Geonode record onto the shared entry schema, one
+// entry per supported protocol. Uptime carries the negative response
+// time so the loader's descending sort puts the fastest proxies first;
+// every record is marked alive and left for the health probe to judge.
+func (entry geonodeProxyEntry) toEntries() []proxyListEntry {
+	if entry.IP == "" || entry.Port == "" {
+		return nil
+	}
+	mapped := make([]proxyListEntry, 0, len(entry.Protocols))
+	for _, protocol := range entry.Protocols {
+		if protocol != "http" && protocol != "socks5" {
+			continue
+		}
+		mapped = append(mapped, proxyListEntry{
+			Proxy:     protocol + "://" + entry.IP + ":" + entry.Port.String(),
+			Protocol:  protocol,
+			Alive:     true,
+			Anonymity: entry.Anonymity,
+			Uptime:    -entry.Latency,
+		})
+	}
+	if len(mapped) == 0 {
+		return nil
+	}
+	return mapped
+}
+
 // decodeProxyList accepts either a bare JSON array of proxy entries or a
 // JSON object carrying one (for example a "proxies" field next to list
-// metadata); the first object field decoding to entries with proxy URLs wins.
+// metadata, or the Geonode API's "data" field); the first object field
+// decoding to entries with proxy URLs wins.
 func decodeProxyList(data []byte) ([]proxyListEntry, error) {
 	var entries []proxyListEntry
 	if err := json.Unmarshal(data, &entries); err == nil {
-		return entries, nil
+		if len(entries) == 0 {
+			return entries, nil
+		}
+		for _, entry := range entries {
+			if entry.Proxy != "" {
+				return entries, nil
+			}
+		}
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil {
 		return nil, fmt.Errorf("expected a proxy list array (or an object wrapping one): %w", err)
 	}
-	// Prefer the "proxies" key, then any other field with entries.
+	// Prefer the "proxies" key (local list files), then "data" (Geonode),
+	// then any other field with entries. Each candidate tries our own
+	// entry schema first, then the Geonode record shape.
 	readEntries := func(raw json.RawMessage) ([]proxyListEntry, bool) {
 		var candidate []proxyListEntry
-		if err := json.Unmarshal(raw, &candidate); err != nil {
-			return nil, false
+		if err := json.Unmarshal(raw, &candidate); err == nil {
+			for _, entry := range candidate {
+				if entry.Proxy != "" {
+					return candidate, true
+				}
+			}
 		}
-		for _, entry := range candidate {
-			if entry.Proxy != "" {
-				return candidate, true
+		var geonode []geonodeProxyEntry
+		if err := json.Unmarshal(raw, &geonode); err == nil {
+			var mapped []proxyListEntry
+			for _, record := range geonode {
+				mapped = append(mapped, record.toEntries()...)
+			}
+			for _, entry := range mapped {
+				if entry.Proxy != "" {
+					return mapped, true
+				}
 			}
 		}
 		return nil, false
 	}
 	if raw, ok := object["proxies"]; ok {
+		if candidate, ok := readEntries(raw); ok {
+			return candidate, nil
+		}
+	}
+	if raw, ok := object["data"]; ok {
 		if candidate, ok := readEntries(raw); ok {
 			return candidate, nil
 		}
@@ -61,7 +129,7 @@ func decodeProxyList(data []byte) ([]proxyListEntry, error) {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if key == "proxies" {
+		if key == "proxies" || key == "data" {
 			continue
 		}
 		if candidate, ok := readEntries(object[key]); ok {
@@ -123,6 +191,52 @@ const (
 	proxyOutcomeFailed
 )
 
+// isProxyListURL reports whether the source looks like a remote proxy
+// list (an http or https URL) rather than a local file path.
+func isProxyListURL(source string) bool {
+	return strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://")
+}
+
+// loadProxyListFile reads and decodes a proxy list from disk.
+func loadProxyListFile(path string) ([]proxyListEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read proxy list: %w", err)
+	}
+	return decodeProxyList(data)
+}
+
+// fetchProxyListEntries downloads a proxy list from an http(s) URL and
+// decodes it with the same rules as a local file. Some list hosts reject
+// default Go user agents, so the request presents a browser one.
+func fetchProxyListEntries(ctx context.Context, source string, timeout time.Duration) ([]proxyListEntry, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build proxy list request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+	res, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch proxy list: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch proxy list: status %d", res.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(res.Body, proxyListMaxBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read proxy list: %w", err)
+	}
+	entries, err := decodeProxyList(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode proxy list: %w", err)
+	}
+	return entries, nil
+}
+
 // loadProxyPool reads a proxy list file, keeps alive elite http/socks5
 // entries ordered by uptime (best first), validates each peer, and keeps
 // only peers that answered within probeTimeout. With a non-empty probeURL
@@ -132,7 +246,7 @@ const (
 // reachability.
 func loadProxyPool(
 	ctx context.Context,
-	path string,
+	source string,
 	cfg proxyPoolConfig,
 	probeTimeout time.Duration,
 	requestTimeout time.Duration,
@@ -141,13 +255,15 @@ func loadProxyPool(
 	if probeTimeout <= 0 {
 		return nil, errors.New("proxy probe timeout must be greater than 0")
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read proxy list: %w", err)
+	var entries []proxyListEntry
+	var err error
+	if isProxyListURL(source) {
+		entries, err = fetchProxyListEntries(ctx, source, requestTimeout)
+	} else {
+		entries, err = loadProxyListFile(source)
 	}
-	entries, err := decodeProxyList(data)
 	if err != nil {
-		return nil, fmt.Errorf("decode proxy list: %w", err)
+		return nil, err
 	}
 
 	type candidate struct {
@@ -193,10 +309,10 @@ func loadProxyPool(
 
 	probed := probeProxyPeers(ctx, ordered, probeTimeout, probeURL)
 	if len(probed) == 0 {
-		return nil, fmt.Errorf("no proxy passed the health probe from %s", path)
+		return nil, fmt.Errorf("no proxy passed the health probe from %s", source)
 	}
 	log.Printf("loaded %d proxies from %s (%d of %d entries passed the health probe)",
-		len(probed), path, len(probed), len(entries))
+		len(probed), source, len(probed), len(entries))
 
 	return &proxyPool{peers: probed, healthy: len(probed), cfg: cfg}, nil
 }

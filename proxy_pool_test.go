@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -422,6 +423,101 @@ func TestSaveRoundTripExcludesEvictedAndOrdersBySuccesses(t *testing.T) {
 	drainedSaved, err := drained.save(filepath.Join(t.TempDir(), "empty.json"))
 	if err != nil || drainedSaved != 0 {
 		t.Fatalf("save with only evicted peers: saved=%d err=%v", drainedSaved, err)
+	}
+}
+
+func TestDecodeGeonodeListMapsRecords(t *testing.T) {
+	payload := `{"data":[` +
+		`{"ip":"178.218.119.29","port":"10808","protocols":["socks5","http"],"anonymityLevel":"elite","responseTime":84,"upTime":98.7},` +
+		`{"ip":"49.148.16.50","port":"8080","protocols":["http","socks4"],"anonymityLevel":"transparent","responseTime":1503},` +
+		`{"ip":"203.0.113.9","port":8844,"protocols":["http"],"anonymityLevel":"elite"},` +
+		`{"ip":"","port":"1","protocols":["http"]}` +
+		`],"total":4}`
+
+	entries, err := decodeProxyList([]byte(payload))
+	if err != nil {
+		t.Fatalf("decode geonode list: %v", err)
+	}
+	if len(entries) != 4 { // socks5 + http from record 1, http from record 2 (socks4 dropped), http from record 3
+		t.Fatalf("decoded %d entries, want 4", len(entries))
+	}
+	if entries[0].Proxy != "socks5://178.218.119.29:10808" || entries[0].Uptime != -84 || entries[0].Anonymity != "elite" {
+		t.Fatalf("entry 0: %+v, want socks5://178.218.119.29:10808 elite with uptime -84", entries[0])
+	}
+	if entries[1].Proxy != "http://178.218.119.29:10808" || entries[1].Uptime != -84 {
+		t.Fatalf("entry 1: %+v", entries[1])
+	}
+	if entries[2].Proxy != "http://49.148.16.50:8080" || entries[2].Anonymity != "transparent" || entries[2].Uptime != -1503 {
+		t.Fatalf("entry 2: %+v (transparent records are kept for the loader's elite filter)", entries[2])
+	}
+	// socks4 is dropped; an unquoted port number still maps cleanly.
+	if entries[3].Proxy != "http://203.0.113.9:8844" || entries[3].Uptime != 0 {
+		t.Fatalf("entry 3: %+v", entries[3])
+	}
+}
+
+func TestLoadProxyPoolFetchesURLSource(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	serverHost := strings.TrimPrefix(target.URL, "http://") // host:port
+	serverAddr, port, _ := strings.Cut(serverHost, ":")
+	payload := fmt.Sprintf(`{"data":[{"ip":%q,"port":%q,"protocols":["socks5","http"],"anonymityLevel":"elite","responseTime":120,"upTime":98},`+
+		`{"ip":"203.0.113.9","port":"9","protocols":["http"],"anonymityLevel":"transparent","responseTime":20}]}`,
+		serverAddr, port)
+	var requests int32
+	listServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(payload))
+	}))
+	defer listServer.Close()
+
+	peerPool, err := loadProxyPool(context.Background(), listServer.URL, freeConfig(), time.Second, 5*time.Second, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&requests) != 1 {
+		t.Fatalf("list fetches = %d, want 1", requests)
+	}
+	// The transparent record is dropped by the elite filter and the same
+	// host serves two peers (one per advertised protocol).
+	if peerPool.healthyPeers() != 2 {
+		t.Fatalf("healthy peers = %d, want 2", peerPool.healthyPeers())
+	}
+	if peerPool.peers[0].raw != "socks5://"+serverHost {
+		t.Fatalf("first peer = %s, want socks5://%s", peerPool.peers[0].raw, serverHost)
+	}
+	if peerPool.peers[1].raw != "http://"+serverHost {
+		t.Fatalf("second peer = %s, want http://%s", peerPool.peers[1].raw, serverHost)
+	}
+}
+
+func TestFetchProxyListEntriesReportsErrors(t *testing.T) {
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer denied.Close()
+	if _, err := fetchProxyListEntries(context.Background(), denied.URL, time.Second); err == nil || !strings.Contains(err.Error(), "status 403") {
+		t.Fatalf("expected 403 error, got %v", err)
+	}
+
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("not json"))
+	}))
+	defer broken.Close()
+	if _, err := fetchProxyListEntries(context.Background(), broken.URL, time.Second); err == nil {
+		t.Fatal("expected decode error for non-JSON body")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := loadProxyPool(ctx, "https://127.0.0.1:1/list", freeConfig(), time.Second, 5*time.Second, ""); err == nil {
+		t.Fatal("expected cancellation error for canceled context")
 	}
 }
 

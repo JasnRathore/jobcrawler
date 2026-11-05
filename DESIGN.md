@@ -101,6 +101,20 @@ Each peer gets its own `http.Transport` pinned to its proxy URL (the
 `socks5` scheme is supported by `net/http` directly), so connection pooling
 is per egress IP and the direct client remains untouched.
 
+### Remote lists
+
+`--proxies` also accepts an `http(s)` URL. The list is fetched once at
+startup with the run's `--timeout` budget and a browser user agent
+(some list hosts reject default Go user agents), capped at 16 MB, and
+decoded with the same rules as local files. The Geonode proxy-list API
+(`https://proxylist.geonode.com/api/proxy-list?...`) maps its `data`
+records onto the shared entry schema: one entry per advertised
+`http`/`socks5` protocol (`socks4` and unknown schemes are ignored,
+`anonymityLevel` filters as usual), with the record's `responseTime`
+(milliseconds) inverted into `uptime` so the loader's descending priority
+sort starts with the fastest proxies. Every record maps to `alive: true`
+and its actual usability is left to the startup tunnel probe.
+
 ### Saving good peers (`--proxy-save`)
 
 `--proxy-save FILE` writes every peer that was still leasable (never
@@ -121,7 +135,7 @@ excluded even if it had earlier successes.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--proxies` | `off` | Path to a proxy list JSON, or `off` for the previous behavior |
+| `--proxies` | `off` | Path to a proxy list JSON, an `http(s)` URL returning one (Geonode API supported), or `off` for the previous behavior |
 | `--proxy-reuse-min` | `0` | Minimum gap before a released proxy may be leased again (on top of any cooldown) |
 | `--proxy-failures` | `5` | Consecutive failures before a proxy is evicted |
 | `--proxy-probe-timeout` | `3s` | Startup health-probe timeout per proxy |
@@ -144,8 +158,9 @@ excluded even if it had earlier successes.
 `proxy_pool_test.go` covers lease exclusivity, LRU selection, reuse gaps,
 `Retry-After` flooring/capping, eviction, direct fallback and context
 cancellation at the state-machine level, plus list filtering/ordering
-(bare array and object-wrapped lists), the tunnel-vs-TCP probe decision,
-the `--proxy-save` stats counters and save/re-decode round trip (evicted
+(bare array and object-wrapped lists, the Geonode record mapping), the
+tunnel-vs-TCP probe decision, URL fetch and decode error paths, the
+`--proxy-save` stats counters and save/re-decode round trip (evicted
 peers excluded, successes-descending ordering), and a `429 → rotate → 200`
 integration test through `fetchProviderResponse`. Existing tests keep
 passing with a nil pool, which pins down the `--proxies off` behavior.

@@ -63,7 +63,7 @@ func run() (returnErr error) {
 	rps := flag.Float64("rps", 50, "max requests per second")
 	requestTimeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout (for example 10s or 1m)")
 	cooldown := flag.Duration("cooldown", 2*time.Minute, "pause all requests after HTTP 429 (for example 3m or 32s)")
-	proxiesPath := flag.String("proxies", "off", "proxy list JSON file for per-peer rotation, or \"off\"")
+	proxiesPath := flag.String("proxies", "off", "proxy list JSON file or http(s) URL (Geonode API supported) for per-peer rotation, or \"off\"")
 	proxyReuseGap := flag.Duration("proxy-reuse-min", 0, "minimum gap before a released proxy is leased again (for example 30s or 5m)")
 	proxyFailures := flag.Int("proxy-failures", 5, "evict a proxy after this many consecutive failures")
 	proxyProbeTimeout := flag.Duration("proxy-probe-timeout", 3*time.Second, "startup health probe timeout per proxy")
