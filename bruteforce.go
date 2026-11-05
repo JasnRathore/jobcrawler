@@ -32,6 +32,7 @@ type checkPool struct {
 
 	ctx      context.Context
 	client   *http.Client
+	proxies  *proxyPool
 	limiter  *requestLimiter
 	database *db.DB
 	stats    *benchmarkStats
@@ -39,12 +40,13 @@ type checkPool struct {
 	failures []checkResult
 }
 
-func newCheckPool(ctx context.Context, client *http.Client, limiter *requestLimiter, database *db.DB, stats *benchmarkStats, provider string, workers int) *checkPool {
+func newCheckPool(ctx context.Context, client *http.Client, proxies *proxyPool, limiter *requestLimiter, database *db.DB, stats *benchmarkStats, provider string, workers int) *checkPool {
 	pool := &checkPool{
 		jobs:     make(chan string, checkQueueSize),
 		results:  make(chan checkResult, workers),
 		ctx:      ctx,
 		client:   client,
+		proxies:  proxies,
 		limiter:  limiter,
 		database: database,
 		stats:    stats,
@@ -55,7 +57,7 @@ func newCheckPool(ctx context.Context, client *http.Client, limiter *requestLimi
 		go func() {
 			defer pool.wg.Done()
 			for slug := range pool.jobs {
-				err := checkProviderCompany(pool.ctx, pool.client, pool.limiter, pool.database, pool.provider, slug, pool.stats)
+				err := checkProviderCompany(pool.ctx, pool.client, pool.proxies, pool.limiter, pool.database, pool.provider, slug, pool.stats)
 				if pool.stats != nil {
 					pool.stats.recordCheck(err != nil)
 				}

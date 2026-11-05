@@ -33,9 +33,9 @@ func (p leverProvider) CompanyEndpoints(slug string) []string {
 func (leverProvider) FallbackOnNotFound() bool { return false }
 
 func (p leverProvider) CheckCompany(
-	ctx context.Context, client *http.Client, limiter *requestLimiter, slug string, stats *benchmarkStats,
+	ctx context.Context, client *http.Client, pool *proxyPool, limiter *requestLimiter, slug string, stats *benchmarkStats,
 ) (bool, error) {
-	response, err := fetchProviderResponse(ctx, client, limiter, p, slug, stats)
+	response, err := fetchProviderResponse(ctx, client, pool, limiter, p, slug, stats)
 	if err != nil || !response.ok {
 		return false, err
 	}
@@ -46,9 +46,9 @@ func (p leverProvider) CheckCompany(
 }
 
 func (p leverProvider) FetchJobs(
-	ctx context.Context, client *http.Client, limiter *requestLimiter, slug string,
+	ctx context.Context, client *http.Client, pool *proxyPool, limiter *requestLimiter, slug string,
 ) ([]db.Job, error) {
-	response, err := fetchProviderResponse(ctx, client, limiter, p, slug, nil)
+	response, err := fetchProviderResponse(ctx, client, pool, limiter, p, slug, nil)
 	if err != nil {
 		return nil, err
 	}

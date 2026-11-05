@@ -88,8 +88,8 @@ type jobBoardProvider interface {
 	Name() string
 	CompanyEndpoints(string) []string
 	FallbackOnNotFound() bool
-	CheckCompany(context.Context, *http.Client, *requestLimiter, string, *benchmarkStats) (bool, error)
-	FetchJobs(context.Context, *http.Client, *requestLimiter, string) ([]db.Job, error)
+	CheckCompany(context.Context, *http.Client, *proxyPool, *requestLimiter, string, *benchmarkStats) (bool, error)
+	FetchJobs(context.Context, *http.Client, *proxyPool, *requestLimiter, string) ([]db.Job, error)
 }
 
 var providerRegistry = map[string]jobBoardProvider{}
@@ -130,6 +130,7 @@ func getProvider(name string) (jobBoardProvider, error) {
 func checkProviderCompany(
 	ctx context.Context,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	database *db.DB,
 	name, slug string,
@@ -139,7 +140,7 @@ func checkProviderCompany(
 	if err != nil {
 		return err
 	}
-	found, err := provider.CheckCompany(ctx, client, limiter, slug, stats)
+	found, err := provider.CheckCompany(ctx, client, pool, limiter, slug, stats)
 	if err != nil {
 		return err
 	}
@@ -157,6 +158,7 @@ func updateProviderJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	name, slug string,
 ) (int, error) {
@@ -164,7 +166,7 @@ func updateProviderJobs(
 	if err != nil {
 		return 0, err
 	}
-	jobs, err := provider.FetchJobs(ctx, client, limiter, slug)
+	jobs, err := provider.FetchJobs(ctx, client, pool, limiter, slug)
 	if err != nil {
 		return 0, err
 	}
@@ -182,6 +184,7 @@ type providerHTTPResponse struct {
 func fetchProviderResponse(
 	ctx context.Context,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	provider jobBoardProvider,
 	slug string,
@@ -195,18 +198,24 @@ func fetchProviderResponse(
 	backoff := 500 * time.Millisecond
 	for attempt := 0; attempt < 4; attempt++ {
 		retry := false
-		cooldownStarted := false
+		skipBackoff := false
 		for i, endpoint := range endpoints {
+			lease, leaseErr := acquireLease(ctx, pool, client)
+			if leaseErr != nil {
+				return providerHTTPResponse{}, leaseErr
+			}
 			if err := limiter.Wait(ctx); err != nil {
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, err
 			}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 			if err != nil {
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, fmt.Errorf("create %s request: %w", name, err)
 			}
 			req.Header.Set("Accept", "application/json")
 			started := time.Now()
-			res, requestErr := client.Do(req)
+			res, requestErr := lease.client.Do(req)
 			status := 0
 			if res != nil {
 				status = res.StatusCode
@@ -218,43 +227,60 @@ func fetchProviderResponse(
 				if res != nil && res.Body != nil {
 					res.Body.Close()
 				}
+				lease.release(proxyOutcomeFailed, 0)
 				retry = true
 				break
 			}
 			if res.StatusCode == http.StatusNotFound && provider.FallbackOnNotFound() && i+1 < len(endpoints) {
 				res.Body.Close()
+				lease.release(proxyOutcomeOK, 0)
 				continue
 			}
 			if res.StatusCode == http.StatusNotFound {
 				res.Body.Close()
+				lease.release(proxyOutcomeOK, 0)
 				return providerHTTPResponse{ok: false}, nil
 			}
 			if res.StatusCode == http.StatusTooManyRequests {
 				res.Body.Close()
-				cooldownStarted = limiter.StartCooldown(name) > 0
+				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
+				lease.release(proxyOutcomeRateLimited, retryAfter)
+				if pool == nil {
+					skipBackoff = limiter.StartCooldown(name) > 0
+				} else {
+					// Rate limiting is per egress IP; the leased peer cools
+					// down and the next attempt rotates to a fresh one.
+					skipBackoff = true
+				}
 				retry = true
 				break
 			}
 			if res.StatusCode >= 500 {
 				res.Body.Close()
+				lease.release(proxyOutcomeFailed, 0)
 				retry = true
 				break
 			}
 			if res.StatusCode < 200 || res.StatusCode >= 300 {
 				res.Body.Close()
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, fmt.Errorf("%s endpoint returned status %d", name, res.StatusCode)
 			}
 			body, err := io.ReadAll(io.LimitReader(res.Body, maxJobsBody+1))
 			closeErr := res.Body.Close()
 			if err != nil {
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, fmt.Errorf("read %s response: %w", name, err)
 			}
 			if closeErr != nil {
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, fmt.Errorf("close %s response: %w", name, closeErr)
 			}
 			if len(body) > maxJobsBody {
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, fmt.Errorf("%s response exceeds %d bytes", name, maxJobsBody)
 			}
+			lease.release(proxyOutcomeOK, 0)
 			return providerHTTPResponse{body: body, ok: true}, nil
 		}
 		if !retry {
@@ -263,7 +289,7 @@ func fetchProviderResponse(
 		if attempt == 3 {
 			return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries", name)
 		}
-		if cooldownStarted {
+		if skipBackoff {
 			continue
 		}
 		select {

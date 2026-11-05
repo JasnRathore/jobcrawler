@@ -63,6 +63,10 @@ func run() (returnErr error) {
 	rps := flag.Float64("rps", 50, "max requests per second")
 	requestTimeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout (for example 10s or 1m)")
 	cooldown := flag.Duration("cooldown", 2*time.Minute, "pause all requests after HTTP 429 (for example 3m or 32s)")
+	proxiesPath := flag.String("proxies", "off", "proxy list JSON file for per-peer rotation, or \"off\"")
+	proxyReuseGap := flag.Duration("proxy-reuse-min", 0, "minimum gap before a released proxy is leased again (for example 30s or 5m)")
+	proxyFailures := flag.Int("proxy-failures", 5, "evict a proxy after this many consecutive failures")
+	proxyProbeTimeout := flag.Duration("proxy-probe-timeout", 3*time.Second, "startup health probe timeout per proxy")
 	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
 	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
 	flag.Parse()
@@ -81,6 +85,15 @@ func run() (returnErr error) {
 	}
 	if *cooldown < 0 {
 		return errors.New("cooldown must not be negative")
+	}
+	if *proxiesPath == "" {
+		return errors.New("proxies must be \"off\" or a proxy list file path")
+	}
+	if *proxyFailures < 1 {
+		return errors.New("proxy failures must be at least 1")
+	}
+	if *proxyProbeTimeout <= 0 {
+		return errors.New("proxy probe timeout must be greater than 0")
 	}
 	selectedPortals := 0
 	selectedProvider := ""
@@ -168,6 +181,20 @@ func run() (returnErr error) {
 		burst = 1
 	}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Limit(*rps), burst), *cooldown)
+	var proxies *proxyPool
+	if *proxiesPath != "off" {
+		proxies, err = loadProxyPool(ctx, *proxiesPath, proxyPoolConfig{
+			minReuseGap:     *proxyReuseGap,
+			maxFailures:     *proxyFailures,
+			retryAfterFloor: time.Second,
+			maxCooldown:     *cooldown,
+		}, *proxyProbeTimeout, *requestTimeout)
+		if err != nil {
+			return err
+		}
+	} else if *proxyReuseGap != 0 {
+		log.Printf("--proxy-reuse-min has no effect without --proxies")
+	}
 	var stats *benchmarkStats
 	if *bench {
 		stats = newBenchmarkStats()
@@ -179,13 +206,13 @@ func run() (returnErr error) {
 		return nil
 	}
 	if *update && *updateJobsFlag {
-		if err := updateAllJobs(ctx, database, client, limiter, *workers); err != nil {
+		if err := updateAllJobs(ctx, database, client, proxies, limiter, *workers); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	pool := newCheckPool(ctx, client, limiter, database, stats, provider, *workers)
+	pool := newCheckPool(ctx, client, proxies, limiter, database, stats, provider, *workers)
 
 	seen := make(map[string]struct{})
 	emit := func(slug string) bool {
@@ -315,23 +342,25 @@ func variants(name string) []string {
 func checkCompany(
 	ctx context.Context,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	database *db.DB,
 	slug string,
 	stats *benchmarkStats,
 ) error {
-	return checkProviderCompany(ctx, client, limiter, database, providerGreenhouse, slug, stats)
+	return checkProviderCompany(ctx, client, pool, limiter, database, providerGreenhouse, slug, stats)
 }
 
 func checkGreenhouseCompany(
 	ctx context.Context,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	database *db.DB,
 	slug string,
 	stats *benchmarkStats,
 ) error {
-	return checkProviderCompany(ctx, client, limiter, database, providerGreenhouse, slug, stats)
+	return checkProviderCompany(ctx, client, pool, limiter, database, providerGreenhouse, slug, stats)
 }
 
 func logFoundCompany(provider, slug string) {

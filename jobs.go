@@ -66,6 +66,7 @@ func updateAllJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	workers int,
 ) error {
@@ -80,7 +81,7 @@ func updateAllJobs(
 		}
 	}
 	return updateJobTargets(ctx, database, targets, workers, func(ctx context.Context, target companyTarget) (int, error) {
-		return updateProviderCompanyJobs(ctx, database, client, limiter, target.provider, target.slug)
+		return updateProviderCompanyJobs(ctx, database, client, pool, limiter, target.provider, target.slug)
 	})
 }
 
@@ -175,20 +176,22 @@ func updateProviderCompanyJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	provider, slug string,
 ) (int, error) {
-	return updateProviderJobs(ctx, database, client, limiter, provider, slug)
+	return updateProviderJobs(ctx, database, client, pool, limiter, provider, slug)
 }
 
 func updateCompanyJobs(
 	ctx context.Context,
 	database *db.DB,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	slug string,
 ) (int, error) {
-	parsedJobs, err := fetchGreenhouseJobs(ctx, client, limiter, slug)
+	parsedJobs, err := fetchGreenhouseJobs(ctx, client, pool, limiter, slug)
 	if err != nil {
 		return 0, err
 	}
@@ -201,6 +204,7 @@ func updateCompanyJobs(
 func fetchGreenhouseJobs(
 	ctx context.Context,
 	client *http.Client,
+	pool *proxyPool,
 	limiter *requestLimiter,
 	slug string,
 ) ([]db.Job, error) {
@@ -209,34 +213,57 @@ func fetchGreenhouseJobs(
 	var response *greenhouseResponse
 
 	for attempt := 0; attempt < 4; attempt++ {
+		lease, leaseErr := acquireLease(ctx, pool, client)
+		if leaseErr != nil {
+			return nil, leaseErr
+		}
 		if err := limiter.Wait(ctx); err != nil {
+			lease.release(proxyOutcomeFailed, 0)
 			return nil, err
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 		if err != nil {
+			lease.release(proxyOutcomeFailed, 0)
 			return nil, fmt.Errorf("create jobs request: %w", err)
 		}
 		req.Header.Set("Accept", "application/json")
-		res, err := client.Do(req)
-		if err != nil && res != nil && res.Body != nil {
-			res.Body.Close()
+		res, err := lease.client.Do(req)
+		if err != nil {
+			if res != nil && res.Body != nil {
+				res.Body.Close()
+			}
+			lease.release(proxyOutcomeFailed, 0)
 		}
 		if err == nil {
 			if res.StatusCode == http.StatusTooManyRequests {
 				res.Body.Close()
-				cooldownStarted := limiter.StartCooldown("greenhouse") > 0
+				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
+				lease.release(proxyOutcomeRateLimited, retryAfter)
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
-				if cooldownStarted {
+				if pool != nil {
+					// Rate limiting is per egress IP; rotate to a fresh peer.
 					if attempt == 3 {
 						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
 					}
 					continue
 				}
+				if limiter.StartCooldown("greenhouse") == 0 {
+					if attempt == 3 {
+						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
+					}
+					// No cooldown configured; wait the standard backoff.
+				} else if attempt == 3 {
+					return nil, fmt.Errorf("fetch jobs after retries: %w", err)
+				} else {
+					continue
+				}
 			} else if res.StatusCode >= 500 {
 				res.Body.Close()
+				lease.release(proxyOutcomeFailed, 0)
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
 			} else if res.StatusCode != http.StatusOK {
 				res.Body.Close()
+				lease.release(proxyOutcomeFailed, 0)
 				return nil, fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
 			} else {
 				var parsed greenhouseResponse
@@ -254,11 +281,14 @@ func fetchGreenhouseJobs(
 				}
 				closeErr := res.Body.Close()
 				if decodeErr != nil {
+					lease.release(proxyOutcomeFailed, 0)
 					return nil, fmt.Errorf("decode jobs response: %w", decodeErr)
 				}
 				if closeErr != nil {
+					lease.release(proxyOutcomeFailed, 0)
 					return nil, fmt.Errorf("close jobs response: %w", closeErr)
 				}
+				lease.release(proxyOutcomeOK, 0)
 				response = &parsed
 				break
 			}

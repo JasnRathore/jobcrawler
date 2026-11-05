@@ -115,7 +115,7 @@ func TestRunBruteForceSupportsAllProviders(t *testing.T) {
 				mu.Unlock()
 				return providerResponse(req, http.StatusNotFound, ""), nil
 			})}
-			pool := newCheckPool(ctx, client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, provider, 4)
+			pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, provider, 4)
 			if err := runBruteForce(ctx, pool, nil, database, 1, 1, true, filepath.Join(t.TempDir(), "failed.txt")); err != nil {
 				t.Fatal(err)
 			}
@@ -160,7 +160,7 @@ func TestRunBruteForceSavesFailuresAndContinuesUpToFivePerCheckpoint(t *testing.
 				}
 				return providerResponse(req, status, ""), nil
 			})}
-			pool := newCheckPool(ctx, client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 1)
+			pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 1)
 			failedPath := filepath.Join(t.TempDir(), "failed.txt")
 			runErr := runBruteForce(ctx, pool, nil, database, 1, 1, true, failedPath)
 			if failures := pool.close(); failures != 0 {
@@ -207,7 +207,7 @@ func TestWordlistCheckFailuresAreSaved(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return providerResponse(req, http.StatusBadRequest, ""), nil
 	})}
-	pool := newCheckPool(ctx, client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), nil, nil, providerGreenhouse, 1)
+	pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), nil, nil, providerGreenhouse, 1)
 	if _, ok := pool.submit("failed-slug"); !ok {
 		t.Fatal("check pool rejected candidate")
 	}
@@ -270,7 +270,7 @@ func TestRunBruteForceContinuesFromSavedPosition(t *testing.T) {
 		}, nil
 	})}
 	newPool := func() *checkPool {
-		return newCheckPool(ctx, client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 4)
+		return newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 4)
 	}
 
 	pool := newPool()
@@ -318,7 +318,7 @@ func TestCheckPoolUsesSharedCheckCompanyPathInBenchmarkMode(t *testing.T) {
 			Request:    req,
 		}, nil
 	})}
-	pool := newCheckPool(ctx, client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, stats, providerGreenhouse, 1)
+	pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, stats, providerGreenhouse, 1)
 	if _, ok := pool.submit("example"); !ok {
 		t.Fatal("benchmark pool rejected candidate")
 	}

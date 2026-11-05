@@ -11,3 +11,4 @@ failed.txt
 scripts/.playwright/profile/
 /frontend
 crawler.exe
+free-proxy-list.json

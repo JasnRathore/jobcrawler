@@ -41,7 +41,7 @@ func TestLeverEUProviderChecksAndIndexesJobs(t *testing.T) {
 	})}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
-	if err := checkProviderCompany(ctx, client, limiter, database, providerLeverEU, "example", nil); err != nil {
+	if err := checkProviderCompany(ctx, client, nil, limiter, database, providerLeverEU, "example", nil); err != nil {
 		t.Fatal(err)
 	}
 	companies, err := database.CompaniesForProvider(ctx, providerLeverEU)
@@ -49,7 +49,7 @@ func TestLeverEUProviderChecksAndIndexesJobs(t *testing.T) {
 		t.Fatalf("Lever companies=%v err=%v", companies, err)
 	}
 
-	count, err := updateProviderJobs(ctx, database, client, limiter, providerLeverEU, "example")
+	count, err := updateProviderJobs(ctx, database, client, nil, limiter, providerLeverEU, "example")
 	if err != nil || count != 1 {
 		t.Fatalf("indexed count=%d err=%v, want one Lever job", count, err)
 	}
@@ -77,7 +77,7 @@ func TestLeverProviderUsesUSAPIOnly(t *testing.T) {
 		}
 		return providerResponse(req, http.StatusOK, `[]`), nil
 	})}
-	if err := checkProviderCompany(context.Background(), client, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), nil, providerLever, "example", nil); err != nil {
+	if err := checkProviderCompany(context.Background(), client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), nil, providerLever, "example", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -132,7 +132,7 @@ func TestWorkableProviderChecksAndIndexesJobs(t *testing.T) {
 	})}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
-	if err := checkProviderCompany(ctx, client, limiter, database, providerWorkable, "example", nil); err != nil {
+	if err := checkProviderCompany(ctx, client, nil, limiter, database, providerWorkable, "example", nil); err != nil {
 		t.Fatal(err)
 	}
 	companies, err := database.CompaniesForProvider(ctx, providerWorkable)
@@ -140,7 +140,7 @@ func TestWorkableProviderChecksAndIndexesJobs(t *testing.T) {
 		t.Fatalf("Workable companies=%v err=%v", companies, err)
 	}
 
-	count, err := updateProviderJobs(ctx, database, client, limiter, providerWorkable, "example")
+	count, err := updateProviderJobs(ctx, database, client, nil, limiter, providerWorkable, "example")
 	if err != nil || count != 1 {
 		t.Fatalf("indexed count=%d err=%v, want one Workable job", count, err)
 	}
@@ -171,7 +171,7 @@ func TestWorkable429StartsSharedCooldownBeforeRetry(t *testing.T) {
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
 
 	started := time.Now()
-	found, err := (workableProvider{}).CheckCompany(context.Background(), client, limiter, "example", nil)
+	found, err := (workableProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func TestAshbyHQProviderChecksAndIndexesListedJobs(t *testing.T) {
 	})}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
-	if err := checkProviderCompany(ctx, client, limiter, database, providerAshbyHQ, "example", nil); err != nil {
+	if err := checkProviderCompany(ctx, client, nil, limiter, database, providerAshbyHQ, "example", nil); err != nil {
 		t.Fatal(err)
 	}
 	companies, err := database.CompaniesForProvider(ctx, providerAshbyHQ)
@@ -241,7 +241,7 @@ func TestAshbyHQProviderChecksAndIndexesListedJobs(t *testing.T) {
 		t.Fatalf("Ashby companies=%v err=%v", companies, err)
 	}
 
-	count, err := updateProviderJobs(ctx, database, client, limiter, providerAshbyHQ, "example")
+	count, err := updateProviderJobs(ctx, database, client, nil, limiter, providerAshbyHQ, "example")
 	if err != nil || count != 1 {
 		t.Fatalf("indexed count=%d err=%v, want one listed Ashby job", count, err)
 	}
