@@ -1,0 +1,178 @@
+[
+ {
+  "proxy": "http://142.93.65.222:3129",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1157,
+  "requests": 1157,
+  "successes": 1157,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://178.83.46.167:3128",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1156,
+  "requests": 1156,
+  "successes": 1156,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "socks5://37.27.245.106:1080",
+  "protocol": "socks5",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1114,
+  "requests": 1114,
+  "successes": 1114,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "socks5://69.55.49.177:38182",
+  "protocol": "socks5",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1094,
+  "requests": 1098,
+  "successes": 1094,
+  "failures": 4,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://122.102.52.24:1081",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1074,
+  "requests": 1074,
+  "successes": 1074,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://194.55.234.58:8080",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1074,
+  "requests": 1074,
+  "successes": 1074,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://182.253.42.232:2026",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1024,
+  "requests": 1024,
+  "successes": 1024,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://103.182.22.85:8000",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1020,
+  "requests": 1020,
+  "successes": 1020,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "socks5://103.182.22.57:9000",
+  "protocol": "socks5",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1009,
+  "requests": 1009,
+  "successes": 1009,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://101.36.112.205:1081",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 1003,
+  "requests": 1003,
+  "successes": 1003,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://9.154.247.186:1080",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 953,
+  "requests": 953,
+  "successes": 953,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://102.244.78.61:8085",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 839,
+  "requests": 839,
+  "successes": 839,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:21Z"
+ },
+ {
+  "proxy": "http://102.244.78.61:8089",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 836,
+  "requests": 836,
+  "successes": 836,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "http://102.244.78.61:8084",
+  "protocol": "http",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 831,
+  "requests": 831,
+  "successes": 831,
+  "failures": 0,
+  "last_used": "2026-11-05T18:39:20Z"
+ },
+ {
+  "proxy": "socks5://45.74.31.46:5062",
+  "protocol": "socks5",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 702,
+  "requests": 710,
+  "successes": 702,
+  "failures": 8,
+  "last_used": "2026-11-05T18:39:21Z"
+ },
+ {
+  "proxy": "socks5://213.199.47.140:1080",
+  "protocol": "socks5",
+  "anonymity": "elite",
+  "alive": true,
+  "uptime": 560,
+  "requests": 565,
+  "successes": 560,
+  "failures": 5,
+  "last_used": "2026-11-05T18:39:20Z"
+ }
+]
