@@ -13,3 +13,4 @@ scripts/.playwright/profile/
 crawler.exe
 free-proxy-list.json
 iplist.json
+ips*.json
