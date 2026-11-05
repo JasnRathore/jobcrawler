@@ -313,6 +313,34 @@ func TestLoadProxyPoolFiltersAndKeepsUptimeOrder(t *testing.T) {
 	}
 }
 
+func TestDecodeProxyListAcceptsBareArrayAndWrappedObject(t *testing.T) {
+	bare := `[{"proxy":"http://127.0.0.1:8080","protocol":"http","alive":true,"anonymity":"elite","uptime":5}]`
+	entries, err := decodeProxyList([]byte(bare))
+	if err != nil || len(entries) != 1 || entries[0].Proxy != "http://127.0.0.1:8080" {
+		t.Fatalf("bare array: entries=%v err=%v", entries, err)
+	}
+
+	wrapped := `{"shown_records":1,"nextpage":false,"proxies":[{"proxy":"socks5://127.0.0.1:1080","protocol":"socks5","alive":true,"anonymity":"elite","uptime":9}]}`
+	entries, err = decodeProxyList([]byte(wrapped))
+	if err != nil || len(entries) != 1 || entries[0].Proxy != "socks5://127.0.0.1:1080" {
+		t.Fatalf("wrapped object: entries=%v err=%v", entries, err)
+	}
+
+	empty := `[]`
+	entries, err = decodeProxyList([]byte(empty))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("empty array: entries=%v err=%v, want no error", entries, err)
+	}
+
+	wrappedWithoutProxies := `{"shown_records":0,"nextpage":false,"proxies":[{}]}`
+	if _, err := decodeProxyList([]byte(wrappedWithoutProxies)); err == nil {
+		t.Fatal("object without proxy entries accepted")
+	}
+	if _, err := decodeProxyList([]byte(`not json`)); err == nil {
+		t.Fatal("non-JSON input accepted")
+	}
+}
+
 func TestLoadProxyPoolFailsWithoutAliveProxy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.json")
 	content := `{"proxy":"http://127.0.0.1:1937","protocol":"http","alive":true,"anonymity":"elite","uptime":9}`

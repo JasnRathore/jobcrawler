@@ -24,6 +24,52 @@ const proxyProbeConcurrency = 64
 // healthy peer is currently leased by another worker.
 const proxyInUsePollInterval = 5 * time.Millisecond
 
+// decodeProxyList accepts either a bare JSON array of proxy entries or a
+// JSON object carrying one (for example a "proxies" field next to list
+// metadata); the first object field decoding to entries with proxy URLs wins.
+func decodeProxyList(data []byte) ([]proxyListEntry, error) {
+	var entries []proxyListEntry
+	if err := json.Unmarshal(data, &entries); err == nil {
+		return entries, nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, fmt.Errorf("expected a proxy list array (or an object wrapping one): %w", err)
+	}
+	// Prefer the "proxies" key, then any other field with entries.
+	readEntries := func(raw json.RawMessage) ([]proxyListEntry, bool) {
+		var candidate []proxyListEntry
+		if err := json.Unmarshal(raw, &candidate); err != nil {
+			return nil, false
+		}
+		for _, entry := range candidate {
+			if entry.Proxy != "" {
+				return candidate, true
+			}
+		}
+		return nil, false
+	}
+	if raw, ok := object["proxies"]; ok {
+		if candidate, ok := readEntries(raw); ok {
+			return candidate, nil
+		}
+	}
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if key == "proxies" {
+			continue
+		}
+		if candidate, ok := readEntries(object[key]); ok {
+			return candidate, nil
+		}
+	}
+	return nil, errors.New("no field contained an array of proxy entries")
+}
+
 type proxyListEntry struct {
 	Proxy     string  `json:"proxy"`
 	Protocol  string  `json:"protocol"`
@@ -90,8 +136,8 @@ func loadProxyPool(
 	if err != nil {
 		return nil, fmt.Errorf("read proxy list: %w", err)
 	}
-	var entries []proxyListEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
+	entries, err := decodeProxyList(data)
+	if err != nil {
 		return nil, fmt.Errorf("decode proxy list: %w", err)
 	}
 
