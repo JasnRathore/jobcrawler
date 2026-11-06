@@ -26,13 +26,18 @@ const (
 type requestLimiter struct {
 	*rate.Limiter
 	cooldown time.Duration
+	maxBurst int
 
 	mu            sync.Mutex
 	cooldownUntil time.Time
 }
 
 func newRequestLimiter(limiter *rate.Limiter, cooldown time.Duration) *requestLimiter {
-	return &requestLimiter{Limiter: limiter, cooldown: cooldown}
+	burst := 1
+	if limiter != nil {
+		burst = limiter.Burst()
+	}
+	return &requestLimiter{Limiter: limiter, cooldown: cooldown, maxBurst: burst}
 }
 
 func (l *requestLimiter) Wait(ctx context.Context) error {
@@ -70,20 +75,29 @@ func (l *requestLimiter) Wait(ctx context.Context) error {
 }
 
 func (l *requestLimiter) StartCooldown(provider string) time.Duration {
-	return l.StartCooldownForStatus(provider, http.StatusTooManyRequests)
+	return l.StartCooldownForStatusAndRetryAfter(provider, http.StatusTooManyRequests, 0)
 }
 
 func (l *requestLimiter) StartCooldownForStatus(provider string, status int) time.Duration {
-	if l.cooldown <= 0 {
+	return l.StartCooldownForStatusAndRetryAfter(provider, status, 0)
+}
+
+func (l *requestLimiter) StartCooldownForStatusAndRetryAfter(provider string, status int, retryAfter time.Duration) time.Duration {
+	cooldownDur := l.cooldown
+	if retryAfter > cooldownDur {
+		cooldownDur = retryAfter
+	}
+	if cooldownDur <= 0 {
 		return 0
 	}
 	now := time.Now()
-	until := now.Add(l.cooldown)
+	until := now.Add(cooldownDur)
 	l.mu.Lock()
 	prevUntil := l.cooldownUntil
 	shouldLog := false
 	if prevUntil.Before(now) {
-		// New cooldown episode
+		// New cooldown episode: clamp burst to 1 so workers wake up smoothly without a 100-burst surge
+		l.Limiter.SetBurst(1)
 		l.cooldownUntil = until
 		shouldLog = true
 	} else if until.Sub(prevUntil) > time.Second {
@@ -267,7 +281,7 @@ func fetchProviderResponse(
 				if pool == nil || lease.directFallback {
 					// A drained-pool fallback still leaves us on the
 					// host-wide egress IP; treat 429s like direct mode.
-					skipBackoff = limiter.StartCooldown(name) > 0
+					skipBackoff = limiter.StartCooldownForStatusAndRetryAfter(name, res.StatusCode, retryAfter) > 0
 				} else {
 					// Rate limiting is per egress IP; the leased peer cools
 					// down and the next attempt rotates to a fresh one.

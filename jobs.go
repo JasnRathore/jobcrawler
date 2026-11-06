@@ -256,7 +256,7 @@ func fetchGreenhouseJobs(
 					}
 					continue
 				}
-				cooldownDuration := limiter.StartCooldownForStatus("greenhouse", res.StatusCode)
+				cooldownDuration := limiter.StartCooldownForStatusAndRetryAfter("greenhouse", res.StatusCode, retryAfter)
 				if rateLimitAttempts >= maxRateLimitAttempts {
 					return nil, fmt.Errorf("fetch jobs after retries: %w", err)
 				}

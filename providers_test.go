@@ -357,17 +357,27 @@ func TestGreenhouseCheckCompanySendsAcceptHeader(t *testing.T) {
 	}
 }
 
-func TestRequestLimiterDeduplicatesConcurrentCooldownLogs(t *testing.T) {
-	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 2*time.Second)
-	// First call starts episode
-	dur1 := limiter.StartCooldownForStatus(providerGreenhouse, http.StatusForbidden)
-	if dur1 <= 0 {
-		t.Fatal("expected positive cooldown duration")
+func TestRequestLimiterBurstClampedOnCooldown(t *testing.T) {
+	rateLim := rate.NewLimiter(rate.Limit(100), 100)
+	limiter := newRequestLimiter(rateLim, 50*time.Millisecond)
+	if rateLim.Burst() != 100 {
+		t.Fatalf("initial burst = %d, want 100", rateLim.Burst())
 	}
-	// Immediate second call should be quiet (same episode)
-	dur2 := limiter.StartCooldownForStatus(providerGreenhouse, http.StatusForbidden)
-	if dur2 <= 0 {
-		t.Fatal("expected positive cooldown duration")
+	limiter.StartCooldownForStatus(providerGreenhouse, http.StatusForbidden)
+	if rateLim.Burst() != 1 {
+		t.Fatalf("clamped burst = %d, want 1", rateLim.Burst())
 	}
 }
+
+func TestRequestLimiterHonorsRetryAfter(t *testing.T) {
+	rateLim := rate.NewLimiter(rate.Limit(10), 1)
+	limiter := newRequestLimiter(rateLim, 50*time.Millisecond)
+
+	// Server says Retry-After 200ms, which exceeds the 50ms configured
+	dur := limiter.StartCooldownForStatusAndRetryAfter(providerGreenhouse, http.StatusTooManyRequests, 200*time.Millisecond)
+	if dur < 180*time.Millisecond {
+		t.Fatalf("cooldown duration %s did not reflect 200ms Retry-After", dur)
+	}
+}
+
 

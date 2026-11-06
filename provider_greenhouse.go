@@ -97,7 +97,7 @@ func (greenhouseProvider) CheckCompany(
 				}
 				continue
 			}
-			cooldownDuration := limiter.StartCooldownForStatus(providerGreenhouse, status)
+			cooldownDuration := limiter.StartCooldownForStatusAndRetryAfter(providerGreenhouse, status, retryAfter)
 			if rateLimitAttempts >= maxRateLimitAttempts {
 				return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
 			}
