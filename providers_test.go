@@ -305,27 +305,35 @@ func TestGreenhouseThrottlingStatusesEnterCooldown(t *testing.T) {
 }
 
 func TestGenericProvidersDoNotEnterCooldownOn403Or406(t *testing.T) {
+	providers := []jobBoardProvider{
+		workableProvider{},
+		leverProvider{name: providerLever, apiHost: "api.lever.co"},
+		leverProvider{name: providerLeverEU, apiHost: "api.eu.lever.co"},
+		ashbyHQProvider{},
+	}
 	statuses := []int{http.StatusForbidden, http.StatusNotAcceptable}
-	for _, status := range statuses {
-		t.Run(fmt.Sprintf("workable-%d", status), func(t *testing.T) {
-			const cooldown = 200 * time.Millisecond
-			requests := 0
-			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				requests++
-				return providerResponse(req, status, "blocked"), nil
-			})}
-			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
-			started := time.Now()
-			found, err := (workableProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
-			if err == nil {
-				t.Fatalf("expected error for status %d, got found=%t", status, found)
-			}
-			if requests != 1 {
-				t.Fatalf("made %d requests, want 1", requests)
-			}
-			if elapsed := time.Since(started); elapsed >= cooldown {
-				t.Fatalf("generic provider erroneously entered cooldown: took %s", elapsed)
-			}
-		})
+	for _, p := range providers {
+		for _, status := range statuses {
+			t.Run(fmt.Sprintf("%s-%d", p.Name(), status), func(t *testing.T) {
+				const cooldown = 200 * time.Millisecond
+				requests := 0
+				client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					requests++
+					return providerResponse(req, status, "blocked"), nil
+				})}
+				limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
+				started := time.Now()
+				found, err := p.CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+				if err == nil {
+					t.Fatalf("expected error for status %d, got found=%t", status, found)
+				}
+				if requests != 1 {
+					t.Fatalf("made %d requests, want 1", requests)
+				}
+				if elapsed := time.Since(started); elapsed >= cooldown {
+					t.Fatalf("%s provider erroneously entered cooldown: took %s", p.Name(), elapsed)
+				}
+			})
+		}
 	}
 }
