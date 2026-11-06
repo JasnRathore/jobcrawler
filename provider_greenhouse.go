@@ -39,7 +39,12 @@ func (greenhouseProvider) CheckCompany(
 	requestURL := fmt.Sprintf(baseURL, url.PathEscape(slug))
 	backoff := 500 * time.Millisecond
 	lastFailure := ""
-	for attempt := 0; attempt < 4; attempt++ {
+	transientAttempts := 0
+	rateLimitAttempts := 0
+	const maxTransientAttempts = 4
+	const maxRateLimitAttempts = 4
+
+	for {
 		lease, leaseErr := acquireLease(ctx, pool, client)
 		if leaseErr != nil {
 			return false, leaseErr
@@ -53,6 +58,7 @@ func (greenhouseProvider) CheckCompany(
 			lease.release(proxyOutcomeFailed, 0)
 			return false, err
 		}
+		req.Header.Set("Accept", "application/json")
 		started := time.Now()
 		res, requestErr := lease.client.Do(req)
 		if res != nil && res.Body != nil {
@@ -63,12 +69,16 @@ func (greenhouseProvider) CheckCompany(
 			status = res.StatusCode
 		}
 		if stats != nil {
-			stats.recordRequest(time.Since(started), status, requestErr != nil, attempt > 0)
+			stats.recordRequest(time.Since(started), status, requestErr != nil, transientAttempts > 0 || rateLimitAttempts > 0)
 		}
 		switch {
 		case requestErr != nil:
 			lease.release(proxyOutcomeFailed, 0)
 			lastFailure = fmt.Sprintf("transport error: %v", requestErr)
+			transientAttempts++
+			if transientAttempts >= maxTransientAttempts {
+				return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
+			}
 		case status == http.StatusOK || status == http.StatusNoContent:
 			lease.release(proxyOutcomeOK, 0)
 			return true, nil
@@ -79,24 +89,31 @@ func (greenhouseProvider) CheckCompany(
 			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 			lease.release(proxyOutcomeRateLimited, retryAfter)
 			lastFailure = fmt.Sprintf("status %d (Retry-After %s)", status, retryAfter)
+			rateLimitAttempts++
+			if pool != nil && !lease.directFallback {
+				// Rate limiting is per egress IP; rotate to a fresh peer.
+				if rateLimitAttempts >= maxRateLimitAttempts {
+					return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
+				}
+				continue
+			}
+			cooldownDuration := limiter.StartCooldownForStatus(providerGreenhouse, status)
+			if rateLimitAttempts >= maxRateLimitAttempts {
+				return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
+			}
+			if cooldownDuration > 0 {
+				continue
+			}
 		case status >= 500:
 			lease.release(proxyOutcomeFailed, 0)
 			lastFailure = fmt.Sprintf("status %d", status)
+			transientAttempts++
+			if transientAttempts >= maxTransientAttempts {
+				return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
+			}
 		default:
 			lease.release(proxyOutcomeFailed, 0)
 			return false, fmt.Errorf("unexpected status %d", status)
-		}
-		if attempt == 3 {
-			return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
-		}
-		if isGreenhouseRateLimited(status) {
-			if pool != nil && !lease.directFallback {
-				// Rate limiting is per egress IP; rotate to a fresh peer.
-				continue
-			}
-			if limiter.StartCooldownForStatus(providerGreenhouse, status) > 0 {
-				continue
-			}
 		}
 		select {
 		case <-time.After(backoff):

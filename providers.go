@@ -77,14 +77,26 @@ func (l *requestLimiter) StartCooldownForStatus(provider string, status int) tim
 	if l.cooldown <= 0 {
 		return 0
 	}
-	until := time.Now().Add(l.cooldown)
+	now := time.Now()
+	until := now.Add(l.cooldown)
 	l.mu.Lock()
-	if until.After(l.cooldownUntil) {
+	prevUntil := l.cooldownUntil
+	shouldLog := false
+	if prevUntil.Before(now) {
+		// New cooldown episode
 		l.cooldownUntil = until
+		shouldLog = true
+	} else if until.Sub(prevUntil) > time.Second {
+		// Meaningfully extended
+		l.cooldownUntil = until
+		shouldLog = true
 	}
 	wait := time.Until(l.cooldownUntil)
 	l.mu.Unlock()
-	log.Printf("%s returned HTTP %d; pausing requests for %s", provider, status, wait.Round(time.Second))
+
+	if shouldLog && wait > 0 {
+		log.Printf("%s returned HTTP %d; pausing requests for %s", provider, status, wait.Round(time.Second))
+	}
 	return wait
 }
 

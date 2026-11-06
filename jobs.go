@@ -212,7 +212,12 @@ func fetchGreenhouseJobs(
 	backoff := 500 * time.Millisecond
 	var response *greenhouseResponse
 
-	for attempt := 0; attempt < 4; attempt++ {
+	transientAttempts := 0
+	rateLimitAttempts := 0
+	const maxTransientAttempts = 4
+	const maxRateLimitAttempts = 4
+
+	for {
 		lease, leaseErr := acquireLease(ctx, pool, client)
 		if leaseErr != nil {
 			return nil, leaseErr
@@ -233,34 +238,39 @@ func fetchGreenhouseJobs(
 				res.Body.Close()
 			}
 			lease.release(proxyOutcomeFailed, 0)
-		}
-		if err == nil {
+			transientAttempts++
+			if transientAttempts >= maxTransientAttempts {
+				return nil, fmt.Errorf("fetch jobs after retries: %w", err)
+			}
+		} else {
 			if isGreenhouseRateLimited(res.StatusCode) {
 				res.Body.Close()
 				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 				lease.release(proxyOutcomeRateLimited, retryAfter)
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
+				rateLimitAttempts++
 				if pool != nil && !lease.directFallback {
 					// Rate limiting is per egress IP; rotate to a fresh peer.
-					if attempt == 3 {
+					if rateLimitAttempts >= maxRateLimitAttempts {
 						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
 					}
 					continue
 				}
-				if limiter.StartCooldownForStatus("greenhouse", res.StatusCode) == 0 {
-					if attempt == 3 {
-						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-					}
-					// No cooldown configured; wait the standard backoff.
-				} else if attempt == 3 {
+				cooldownDuration := limiter.StartCooldownForStatus("greenhouse", res.StatusCode)
+				if rateLimitAttempts >= maxRateLimitAttempts {
 					return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-				} else {
+				}
+				if cooldownDuration > 0 {
 					continue
 				}
 			} else if res.StatusCode >= 500 {
 				res.Body.Close()
 				lease.release(proxyOutcomeFailed, 0)
 				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
+				transientAttempts++
+				if transientAttempts >= maxTransientAttempts {
+					return nil, fmt.Errorf("fetch jobs after retries: %w", err)
+				}
 			} else if res.StatusCode != http.StatusOK {
 				res.Body.Close()
 				lease.release(proxyOutcomeFailed, 0)
@@ -294,9 +304,6 @@ func fetchGreenhouseJobs(
 			}
 		}
 
-		if attempt == 3 {
-			return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-		}
 		select {
 		case <-time.After(backoff):
 			backoff *= 2

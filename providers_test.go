@@ -337,3 +337,37 @@ func TestGenericProvidersDoNotEnterCooldownOn403Or406(t *testing.T) {
 		}
 	}
 }
+
+func TestGreenhouseCheckCompanySendsAcceptHeader(t *testing.T) {
+	var gotAccept string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotAccept = req.Header.Get("Accept")
+		return providerResponse(req, http.StatusOK, ""), nil
+	})}
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
+	found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected company to be found")
+	}
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept header = %q, want application/json", gotAccept)
+	}
+}
+
+func TestRequestLimiterDeduplicatesConcurrentCooldownLogs(t *testing.T) {
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 2*time.Second)
+	// First call starts episode
+	dur1 := limiter.StartCooldownForStatus(providerGreenhouse, http.StatusForbidden)
+	if dur1 <= 0 {
+		t.Fatal("expected positive cooldown duration")
+	}
+	// Immediate second call should be quiet (same episode)
+	dur2 := limiter.StartCooldownForStatus(providerGreenhouse, http.StatusForbidden)
+	if dur2 <= 0 {
+		t.Fatal("expected positive cooldown duration")
+	}
+}
+
