@@ -70,6 +70,10 @@ func (l *requestLimiter) Wait(ctx context.Context) error {
 }
 
 func (l *requestLimiter) StartCooldown(provider string) time.Duration {
+	return l.StartCooldownForStatus(provider, http.StatusTooManyRequests)
+}
+
+func (l *requestLimiter) StartCooldownForStatus(provider string, status int) time.Duration {
 	if l.cooldown <= 0 {
 		return 0
 	}
@@ -80,7 +84,7 @@ func (l *requestLimiter) StartCooldown(provider string) time.Duration {
 	}
 	wait := time.Until(l.cooldownUntil)
 	l.mu.Unlock()
-	log.Printf("%s returned HTTP 429; pausing requests for %s", provider, wait.Round(time.Second))
+	log.Printf("%s returned HTTP %d; pausing requests for %s", provider, status, wait.Round(time.Second))
 	return wait
 }
 

@@ -24,6 +24,10 @@ func (greenhouseProvider) CompanyEndpoints(slug string) []string {
 
 func (greenhouseProvider) FallbackOnNotFound() bool { return false }
 
+func isGreenhouseRateLimited(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusForbidden || status == http.StatusNotAcceptable
+}
+
 func (greenhouseProvider) CheckCompany(
 	ctx context.Context,
 	client *http.Client,
@@ -32,7 +36,7 @@ func (greenhouseProvider) CheckCompany(
 	slug string,
 	stats *benchmarkStats,
 ) (bool, error) {
-	requestURL := fmt.Sprintf(baseURL, slug)
+	requestURL := fmt.Sprintf(baseURL, url.PathEscape(slug))
 	backoff := 500 * time.Millisecond
 	lastFailure := ""
 	for attempt := 0; attempt < 4; attempt++ {
@@ -71,7 +75,7 @@ func (greenhouseProvider) CheckCompany(
 		case status == http.StatusNotFound:
 			lease.release(proxyOutcomeOK, 0)
 			return false, nil
-		case status == http.StatusTooManyRequests:
+		case isGreenhouseRateLimited(status):
 			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 			lease.release(proxyOutcomeRateLimited, retryAfter)
 			lastFailure = fmt.Sprintf("status %d (Retry-After %s)", status, retryAfter)
@@ -85,12 +89,12 @@ func (greenhouseProvider) CheckCompany(
 		if attempt == 3 {
 			return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
 		}
-		if status == http.StatusTooManyRequests {
+		if isGreenhouseRateLimited(status) {
 			if pool != nil && !lease.directFallback {
 				// Rate limiting is per egress IP; rotate to a fresh peer.
 				continue
 			}
-			if limiter.StartCooldown(providerGreenhouse) > 0 {
+			if limiter.StartCooldownForStatus(providerGreenhouse, status) > 0 {
 				continue
 			}
 		}

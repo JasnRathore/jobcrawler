@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -268,5 +269,63 @@ func providerResponse(req *http.Request, status int, body string) *http.Response
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    req,
+	}
+}
+
+func TestGreenhouseThrottlingStatusesEnterCooldown(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable, http.StatusTooManyRequests} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			const cooldown = 80 * time.Millisecond
+			requests := 0
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				if requests == 1 {
+					return providerResponse(req, status, ""), nil
+				}
+				return providerResponse(req, http.StatusOK, ""), nil
+			})}
+			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
+
+			started := time.Now()
+			found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("Greenhouse company was not found after retry")
+			}
+			if requests != 2 {
+				t.Fatalf("made %d requests, want 2", requests)
+			}
+			if elapsed := time.Since(started); elapsed < cooldown {
+				t.Fatalf("retry completed after %s, before the %s cooldown", elapsed, cooldown)
+			}
+		})
+	}
+}
+
+func TestGenericProvidersDoNotEnterCooldownOn403Or406(t *testing.T) {
+	statuses := []int{http.StatusForbidden, http.StatusNotAcceptable}
+	for _, status := range statuses {
+		t.Run(fmt.Sprintf("workable-%d", status), func(t *testing.T) {
+			const cooldown = 200 * time.Millisecond
+			requests := 0
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				return providerResponse(req, status, "blocked"), nil
+			})}
+			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
+			started := time.Now()
+			found, err := (workableProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+			if err == nil {
+				t.Fatalf("expected error for status %d, got found=%t", status, found)
+			}
+			if requests != 1 {
+				t.Fatalf("made %d requests, want 1", requests)
+			}
+			if elapsed := time.Since(started); elapsed >= cooldown {
+				t.Fatalf("generic provider erroneously entered cooldown: took %s", elapsed)
+			}
+		})
 	}
 }

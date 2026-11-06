@@ -235,7 +235,7 @@ func fetchGreenhouseJobs(
 			lease.release(proxyOutcomeFailed, 0)
 		}
 		if err == nil {
-			if res.StatusCode == http.StatusTooManyRequests {
+			if isGreenhouseRateLimited(res.StatusCode) {
 				res.Body.Close()
 				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 				lease.release(proxyOutcomeRateLimited, retryAfter)
@@ -247,7 +247,7 @@ func fetchGreenhouseJobs(
 					}
 					continue
 				}
-				if limiter.StartCooldown("greenhouse") == 0 {
+				if limiter.StartCooldownForStatus("greenhouse", res.StatusCode) == 0 {
 					if attempt == 3 {
 						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
 					}

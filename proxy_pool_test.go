@@ -816,3 +816,57 @@ func (p rotationTestProvider) FetchJobs(
 	}
 	return []db.Job{}, nil
 }
+
+func TestGreenhouseRotatesPeerOn403And406(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var mu sync.Mutex
+			hits := map[string]int{}
+			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				mu.Lock()
+				hits["limited"]++
+				mu.Unlock()
+				return &http.Response{
+					StatusCode: status,
+					Header:     http.Header{"Retry-After": []string{"2"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			})}}
+			healthyPeer := &proxyPeer{raw: "http://healthy:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				mu.Lock()
+				hits["healthy"]++
+				mu.Unlock()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			})}}
+			pool := &proxyPool{
+				peers:   []*proxyPeer{limitedPeer, healthyPeer},
+				healthy: 2,
+				cfg:     freeConfig(),
+			}
+			found, err := (greenhouseProvider{}).CheckCompany(
+				context.Background(), &http.Client{}, pool, testLimiter(), "example", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found {
+				t.Fatal("expected company to be found after rotation")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if hits["limited"] != 1 || hits["healthy"] != 1 {
+				t.Fatalf("hit counts = %v, want 1 limited and 1 healthy", hits)
+			}
+			if limitedPeer.failures != 1 {
+				t.Fatalf("rate limited peer failures = %d, want 1", limitedPeer.failures)
+			}
+			if time.Until(limitedPeer.cooldownUntil) <= 0 {
+				t.Fatal("Retry-After did not set cooldown on limited peer")
+			}
+		})
+	}
+}
