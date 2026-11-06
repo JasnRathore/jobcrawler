@@ -98,11 +98,18 @@ func (greenhouseProvider) CheckCompany(
 				continue
 			}
 			cooldownDuration := limiter.StartCooldownForStatusAndRetryAfter(providerGreenhouse, status, retryAfter)
+			if cooldownDuration > 0 {
+				if rateLimitAttempts >= maxRateLimitAttempts {
+					return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
+				}
+				// Wait for the shared cooldown to elapse so this worker doesn't hammer the API during the pause
+				if err := limiter.Wait(ctx); err != nil {
+					return false, err
+				}
+				continue
+			}
 			if rateLimitAttempts >= maxRateLimitAttempts {
 				return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)
-			}
-			if cooldownDuration > 0 {
-				continue
 			}
 		case status >= 500:
 			lease.release(proxyOutcomeFailed, 0)
