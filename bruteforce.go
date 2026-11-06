@@ -165,6 +165,24 @@ func runBruteForce(
 		}
 		pool.flush()
 		failed := pool.takeFailures()
+
+		// Tier 3: In-flight batch requeue.
+		// If any candidate failed (e.g. temporary throttling or rate-limiting),
+		// retry them within the batch up to maxBatchRetries rounds after waiting for cooldown.
+		const maxBatchRetries = 3
+		for retryRound := 0; retryRound < maxBatchRetries && len(failed) > 0 && ctx.Err() == nil; retryRound++ {
+			toRetry := failed
+			failed = nil
+			for _, failure := range toRetry {
+				_, submitted := pool.submit(failure.slug)
+				if !submitted {
+					break
+				}
+			}
+			pool.flush()
+			failed = pool.takeFailures()
+		}
+
 		if len(failed) > 0 {
 			if err := appendFailedCandidates(failedPath, failed); err != nil {
 				return err

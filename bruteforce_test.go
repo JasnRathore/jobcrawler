@@ -339,3 +339,54 @@ func TestCheckPoolUsesSharedCheckCompanyPathInBenchmarkMode(t *testing.T) {
 		t.Fatalf("benchmark stats checks=%d requests=%d transport-errors=%d; want 1, 1, 0", checks, requests, errors)
 	}
 }
+
+func TestRunBruteForceRequeuesThrottledCandidatesSuccessfully(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "requeue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	var mu sync.Mutex
+	attemptsPerSlug := make(map[string]int)
+
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		slug := req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]
+		mu.Lock()
+		attemptsPerSlug[slug]++
+		attempt := attemptsPerSlug[slug]
+		mu.Unlock()
+
+		// First 4 attempts (across rounds) return 500 error, 5th attempt (via in-flight batch requeue) succeeds
+		if attempt <= 4 {
+			return providerResponse(req, http.StatusInternalServerError, ""), nil
+		}
+		return providerResponse(req, http.StatusNotFound, ""), nil
+	})}
+
+	pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 1)
+	failedPath := filepath.Join(t.TempDir(), "failed.txt")
+
+	if err := runBruteForce(ctx, pool, nil, database, 1, 1, true, failedPath); err != nil {
+		t.Fatalf("runBruteForce failed unexpectedly: %v", err)
+	}
+	if failures := pool.close(); failures != 0 {
+		t.Fatalf("check pool reported %d failures", failures)
+	}
+
+	// Verify failed.txt has 0 entries (candidate was successfully requeued and processed)
+	if _, err := os.Stat(failedPath); !os.IsNotExist(err) {
+		content, _ := os.ReadFile(failedPath)
+		if len(strings.TrimSpace(string(content))) > 0 {
+			t.Fatalf("failed.txt is not empty: %s", content)
+		}
+	}
+
+	// Checkpoint should have reached 26 (100% completed)
+	position, err := database.StartProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 1, alphabet, bruteCount(1, 1))
+	if err != nil || position != bruteCount(1, 1) {
+		t.Fatalf("checkpoint position = %d, want %d", position, bruteCount(1, 1))
+	}
+}
+
