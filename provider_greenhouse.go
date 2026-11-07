@@ -129,7 +129,6 @@ func (greenhouseProvider) CheckCompany(
 			return false, ctx.Err()
 		}
 	}
-	return false, fmt.Errorf("gave up checking Greenhouse company after retries")
 }
 
 func (greenhouseProvider) FetchJobs(

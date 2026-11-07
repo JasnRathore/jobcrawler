@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -148,8 +150,24 @@ func run() (returnErr error) {
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The first interrupt unwinds gracefully through checkpoints and
+	// result saving; a second one force-quits in case shutdown stalls.
+	// signal.Notify fans every press out to all registrations, so count
+	// them to keep the first press graceful.
+	var interrupts int32
+	quit := make(chan os.Signal, 4)
+	signal.Notify(quit, os.Interrupt)
+	go func() {
+		for range quit {
+			if atomic.AddInt32(&interrupts, 1) == 2 {
+				log.Printf("second interrupt; exiting immediately")
+				os.Exit(130)
+			}
+		}
+	}()
 
 	// Collect mode curation runs database-free: fetch the sources,
 	// probe against the provider endpoint, and write the curated file.
@@ -298,6 +316,11 @@ func run() (returnErr error) {
 	}
 
 	pool.close()
+	// Interrupted runs leave checks whose results were only collected by
+	// close(); persist them so failed.txt stays complete.
+	if err := saveCheckFailures(pool, "failed.txt"); err != nil {
+		log.Printf("save check failures: %v", err)
+	}
 	if stats != nil {
 		stats.print(time.Since(started))
 	}

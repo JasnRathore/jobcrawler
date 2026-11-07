@@ -44,6 +44,17 @@ Two invariants hold in every mode:
                      └──────────────────────────────────────────────┘
 ```
 
+### Interrupting a run
+
+Ctrl+C unwinds gracefully: cleanup runs in order (proxy-list flush,
+`failed.txt` saves, checkpoints), and workers never block past it —
+after cancellation a worker delivers its result only if the results
+buffer has room and drops it otherwise, so the command queue finishes
+fast-failing and `close()` drains whatever is buffered into
+`failed.txt`. A second Ctrl+C force-quits immediately with exit 130 no
+matter where shutdown is. `SIGTERM` triggers the same graceful unwind
+(Windows ignores it; the force-quit path makes the guarantee portable).
+
 ## Proxy pool
 
 ### Leasing
@@ -180,6 +191,11 @@ saved pool files all work as sources.
    crawl checkpoint, so interrupted updates resume where they stopped.
 
 ## Testing notes
+
+`bruteforce_test.go` includes the interrupt regression: a pool whose
+workers are stuck inside checks is cancelled and `close()` must return
+promptly with the buffered results, failing at a 5s watchdog the way the
+pre-fix pool hung.
 
 `proxy_pool_test.go` covers lease exclusivity, LRU selection, reuse gaps,
 `Retry-After` flooring/capping, eviction, direct fallback and context

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"db"
 	"golang.org/x/time/rate"
@@ -390,3 +391,45 @@ func TestRunBruteForceRequeuesThrottledCandidatesSuccessfully(t *testing.T) {
 	}
 }
 
+// Regression for the shutdown hang: after cancellation flush() stops
+// draining the moment results stop flowing, while up to checkQueueSize
+// checks are still in flight; workers blocked sending into the results
+// buffer then made close()'s wg.Wait() wait forever, so Ctrl+C appeared
+// to be ignored. close() must now return and collect what is buffered.
+func TestCheckPoolCloseReturnsAfterCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "cancel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	// Every check blocks until the pool context is cancelled, so both
+	// workers sit inside their checks with nothing sent or drained yet.
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 2)
+
+	for i := 0; i < 6; i++ {
+		if _, ok := pool.submit(bruteSlugAt(1, 1, int64(i))); !ok {
+			t.Fatal("submit rejected a slug before cancellation")
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	done := make(chan int, 1)
+	go func() {
+		done <- pool.close()
+	}()
+	select {
+	case drained := <-done:
+		if drained != 2 {
+			t.Fatalf("close collected %d failures, want the 2 results buffered when the window stalled", drained)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pool.close did not finish after cancellation; worker result sends are stuck")
+	}
+}

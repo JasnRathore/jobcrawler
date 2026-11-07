@@ -62,7 +62,20 @@ func newCheckPool(ctx context.Context, client *http.Client, proxies *proxyPool, 
 				if pool.stats != nil {
 					pool.stats.recordCheck(err != nil)
 				}
-				pool.results <- checkResult{slug: slug, err: err}
+				// After cancellation nobody is guaranteed to be draining
+				// results, so blocking on a full buffer would hang the
+				// worker forever and stall close(); prefer delivering
+				// whenever the buffer has room, and drop only when it is
+				// full while the context is done.
+				result := checkResult{slug: slug, err: err}
+				select {
+				case pool.results <- result:
+				default:
+					select {
+					case pool.results <- result:
+					case <-pool.ctx.Done():
+					}
+				}
 			}
 		}()
 	}
@@ -140,11 +153,28 @@ func saveCheckFailures(pool *checkPool, path string) error {
 	return appendFailedCandidates(path, failures)
 }
 
+// close stops accepting jobs, waits for every worker to finish, and
+// returns the number of failures collected while shutting down. After
+// cancellation flush stops as soon as results stop flowing, so any
+// remainder buffered until the workers exited is gathered here.
 func (p *checkPool) close() int {
 	failures := p.flush()
 	close(p.jobs)
 	p.wg.Wait()
-	return failures
+	for {
+		select {
+		case result := <-p.results:
+			if p.pending > 0 {
+				p.pending--
+			}
+			if result.err != nil {
+				failures++
+				p.failures = append(p.failures, result)
+			}
+		default:
+			return failures
+		}
+	}
 }
 
 func runBruteForce(
