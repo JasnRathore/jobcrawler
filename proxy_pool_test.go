@@ -33,10 +33,11 @@ func newTestPool(cfg proxyPoolConfig, peers ...string) *proxyPool {
 
 func freeConfig() proxyPoolConfig {
 	return proxyPoolConfig{
-		minReuseGap:     0,
-		maxFailures:     0,
-		retryAfterFloor: 0,
-		maxCooldown:     0,
+		minReuseGap:         0,
+		maxFailures:         0,
+		retryAfterFloor:     0,
+		maxCooldown:         0,
+		allowDirectFallback: true,
 	}
 }
 
@@ -231,6 +232,17 @@ func TestProxyPoolDirectFallbackWithNoHealthyPeers(t *testing.T) {
 	}
 	if !direct {
 		t.Fatal("empty pool did not request the direct fallback")
+	}
+}
+
+func TestProxyPoolFailClosedWhenDirectFallbackDisallowed(t *testing.T) {
+	cfg := freeConfig()
+	cfg.allowDirectFallback = false
+	pool := newTestPool(cfg)
+
+	_, _, err := pool.acquire(context.Background())
+	if err == nil {
+		t.Fatal("expected fail-closed error when allowDirectFallback is false, got nil")
 	}
 }
 

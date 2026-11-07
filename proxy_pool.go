@@ -171,6 +171,9 @@ type proxyPoolConfig struct {
 	retryAfterFloor time.Duration
 	// maxCooldown caps any cooldown a peer can be given. Zero disables the cap.
 	maxCooldown time.Duration
+	// allowDirectFallback permits fallback to direct connection when all proxies are evicted.
+	// When false (default), acquire returns an error when pool is exhausted (fail-closed).
+	allowDirectFallback bool
 }
 
 type proxyPool struct {
@@ -425,6 +428,9 @@ func newPeerClient(proxyURL *url.URL, timeout time.Duration) *http.Client {
 	tr := &http.Transport{
 		Proxy:               http.ProxyURL(proxyURL),
 		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        128,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 3 * time.Second,
 	}
 	return &http.Client{Transport: tr, Timeout: timeout}
@@ -433,12 +439,15 @@ func newPeerClient(proxyURL *url.URL, timeout time.Duration) *http.Client {
 // acquire leases a peer exclusively. It blocks until a peer is eligible
 // (idle, past its reuse gap and cooldown) or the context ends. If no
 // healthy peer remains it reports directFallback so callers can send from
-// the local address, and logs the switch.
+// the local address, and logs the switch (unless fail-closed is active).
 func (p *proxyPool) acquire(ctx context.Context) (*proxyPeer, bool, error) {
 	for {
 		p.mu.Lock()
 		if p.healthy == 0 {
 			p.mu.Unlock()
+			if !p.cfg.allowDirectFallback {
+				return nil, false, errors.New("proxy pool exhausted: all healthy proxies evicted (fail-closed to protect host IP)")
+			}
 			p.warnDirectFallback()
 			return nil, true, nil
 		}
@@ -518,7 +527,7 @@ func (p *proxyPool) release(peer *proxyPeer, outcome proxyOutcome, retryAfter ti
 		peer.failures = 0
 		peer.successes++
 	case proxyOutcomeRateLimited:
-		peer.failures++
+		// Upstream edge throttle is not a peer transport death; cool down without counting toward eviction.
 		peer.failuresTotal++
 		wait := retryAfter
 		if wait < p.cfg.retryAfterFloor {

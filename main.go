@@ -68,6 +68,7 @@ func run() (returnErr error) {
 	proxyFailures := flag.Int("proxy-failures", 5, "evict a proxy after this many consecutive failures")
 	proxyProbeTimeout := flag.Duration("proxy-probe-timeout", 3*time.Second, "startup health probe timeout per proxy")
 	proxySavePath := flag.String("proxy-save", "", "write surviving proxies with request stats to this JSON file (for example ips.json)")
+	allowDirectFallback := flag.Bool("allow-direct-fallback", false, "allow fallback to direct local IP when all proxies in the pool are evicted (disabled by default to prevent IP leaks)")
 	collectPath := flag.String("collect-proxies", "", "collect and validate proxies from --proxy-sources (or --proxies) and write survivors to this JSON file instead of crawling")
 	proxySources := flag.String("proxy-sources", "", "comma-separated proxy list files or URLs to feed --collect-proxies")
 	collectIterations := flag.Int("collect-iterations", 2, "probe rounds per proxy in --collect-proxies mode; more rounds keep only stable proxies")
@@ -222,10 +223,11 @@ func run() (returnErr error) {
 		// admit proxies that open connections but never forward CONNECT.
 		probeURL := providerProbeURL(provider)
 		proxies, err = loadProxyPool(ctx, *proxiesPath, proxyPoolConfig{
-			minReuseGap:     *proxyReuseGap,
-			maxFailures:     *proxyFailures,
-			retryAfterFloor: time.Second,
-			maxCooldown:     *cooldown,
+			minReuseGap:         *proxyReuseGap,
+			maxFailures:         *proxyFailures,
+			retryAfterFloor:     time.Second,
+			maxCooldown:         *cooldown,
+			allowDirectFallback: *allowDirectFallback,
 		}, *proxyProbeTimeout, *requestTimeout, probeURL)
 		if err != nil {
 			return err
