@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,6 +39,7 @@ type requestLimiter struct {
 
 	mu            sync.Mutex
 	cooldownUntil time.Time
+	stopped       map[string]*providerStopError
 }
 
 func newRequestLimiter(limiter *rate.Limiter, cooldown time.Duration) *requestLimiter {
@@ -45,7 +47,12 @@ func newRequestLimiter(limiter *rate.Limiter, cooldown time.Duration) *requestLi
 	if limiter != nil {
 		burst = limiter.Burst()
 	}
-	return &requestLimiter{Limiter: limiter, cooldown: cooldown, maxBurst: burst}
+	return &requestLimiter{
+		Limiter:  limiter,
+		cooldown: cooldown,
+		maxBurst: burst,
+		stopped:  make(map[string]*providerStopError),
+	}
 }
 
 func (l *requestLimiter) Wait(ctx context.Context) error {
@@ -123,6 +130,95 @@ func (l *requestLimiter) StartCooldownForStatusAndRetryAfter(provider string, st
 		log.Printf("%s returned HTTP %d; pausing requests for %s", provider, status, wait.Round(time.Second))
 	}
 	return wait
+}
+
+var errProviderStopped = errors.New("provider stopped after a destination restriction signal")
+
+type providerStopError struct {
+	provider   string
+	status     int
+	retryAfter time.Duration
+	retryAt    time.Time
+	reason     string
+}
+
+func (e *providerStopError) Error() string {
+	if !e.retryAt.IsZero() {
+		return fmt.Sprintf("%s stopped after HTTP %d (%s); retry no earlier than %s",
+			e.provider, e.status, e.reason, e.retryAt.Format(time.RFC3339))
+	}
+	return fmt.Sprintf("%s stopped after HTTP %d (%s)", e.provider, e.status, e.reason)
+}
+
+func (e *providerStopError) Unwrap() error { return errProviderStopped }
+
+func (l *requestLimiter) providerStop(provider string) *providerStopError {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stopped[provider]
+}
+
+func (l *requestLimiter) stopProvider(stop *providerStopError) *providerStopError {
+	if l == nil || stop == nil {
+		return stop
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if existing := l.stopped[stop.provider]; existing != nil {
+		return existing
+	}
+	l.stopped[stop.provider] = stop
+	return stop
+}
+
+func (l *requestLimiter) waitForProvider(ctx context.Context, provider string) error {
+	if stop := l.providerStop(provider); stop != nil {
+		return stop
+	}
+	return l.Wait(ctx)
+}
+
+func isDestinationStopResponse(res *http.Response) bool {
+	if res == nil {
+		return false
+	}
+	switch res.StatusCode {
+	case http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden,
+		http.StatusProxyAuthRequired, http.StatusNotAcceptable, http.StatusUnavailableForLegalReasons:
+		return true
+	}
+	for _, header := range []string{"CF-Mitigated", "X-Datadome", "X-Captcha", "X-Cloudflare-Challenge", "X-Sucuri-Block"} {
+		if value := strings.TrimSpace(res.Header.Get(header)); value != "" {
+			if strings.EqualFold(header, "CF-Mitigated") && !strings.EqualFold(value, "challenge") {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func destinationStopError(provider string, res *http.Response) *providerStopError {
+	reason := "access-control or challenge response"
+	if res.StatusCode == http.StatusTooManyRequests {
+		reason = "rate limit"
+	}
+	now := time.Now()
+	retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), now)
+	var retryAt time.Time
+	if retryAfter > 0 {
+		retryAt = now.Add(retryAfter)
+	}
+	return &providerStopError{
+		provider:   provider,
+		status:     res.StatusCode,
+		retryAfter: retryAfter,
+		retryAt:    retryAt,
+		reason:     reason,
+	}
 }
 
 type jobBoardProvider interface {
@@ -240,13 +336,12 @@ func fetchProviderResponse(
 	lastFailure := ""
 	for attempt := 0; attempt < 4; attempt++ {
 		retry := false
-		skipBackoff := false
 		for i, endpoint := range endpoints {
 			lease, leaseErr := acquireLease(ctx, pool, client)
 			if leaseErr != nil {
 				return providerHTTPResponse{}, leaseErr
 			}
-			if err := limiter.Wait(ctx); err != nil {
+			if err := limiter.waitForProvider(ctx, name); err != nil {
 				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, err
 			}
@@ -274,6 +369,16 @@ func fetchProviderResponse(
 				retry = true
 				break
 			}
+			if isDestinationStopResponse(res) {
+				res.Body.Close()
+				stop := destinationStopError(name, res)
+				if res.StatusCode == http.StatusTooManyRequests {
+					lease.release(proxyOutcomeRateLimited, stop.retryAfter)
+				} else {
+					lease.release(proxyOutcomeFailed, 0)
+				}
+				return providerHTTPResponse{}, limiter.stopProvider(stop)
+			}
 			if res.StatusCode == http.StatusNotFound && provider.FallbackOnNotFound() && i+1 < len(endpoints) {
 				res.Body.Close()
 				lease.release(proxyOutcomeOK, 0)
@@ -283,23 +388,6 @@ func fetchProviderResponse(
 				res.Body.Close()
 				lease.release(proxyOutcomeOK, 0)
 				return providerHTTPResponse{ok: false}, nil
-			}
-			if res.StatusCode == http.StatusTooManyRequests {
-				res.Body.Close()
-				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
-				lease.release(proxyOutcomeRateLimited, retryAfter)
-				lastFailure = fmt.Sprintf("status %d (Retry-After %s)", res.StatusCode, retryAfter)
-				if pool == nil || lease.directFallback {
-					// A drained-pool fallback still leaves us on the
-					// host-wide egress IP; treat 429s like direct mode.
-					skipBackoff = limiter.StartCooldownForStatusAndRetryAfter(name, res.StatusCode, retryAfter) > 0
-				} else {
-					// Rate limiting is per egress IP; the leased peer cools
-					// down and the next attempt rotates to a fresh one.
-					skipBackoff = true
-				}
-				retry = true
-				break
 			}
 			if res.StatusCode >= 500 {
 				res.Body.Close()
@@ -335,9 +423,6 @@ func fetchProviderResponse(
 		}
 		if attempt == 3 {
 			return providerHTTPResponse{}, fmt.Errorf("fetch %s response after retries (last: %s)", name, lastFailure)
-		}
-		if skipBackoff {
-			continue
 		}
 		select {
 		case <-time.After(backoff):

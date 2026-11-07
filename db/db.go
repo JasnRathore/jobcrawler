@@ -2,13 +2,16 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
 	_ "turso.tech/database/tursogo"
@@ -157,6 +160,9 @@ func (d *DB) migrateLegacySchema(ctx context.Context) error {
 	if err := migrateBruteCheckpoints(ctx, tx); err != nil {
 		return err
 	}
+	if err := migrateJobUpdateRuns(ctx, tx); err != nil {
+		return err
+	}
 	if err := migrateIndexedTable(ctx, tx, "indexed_jobs", false); err != nil {
 		return err
 	}
@@ -224,6 +230,61 @@ func (d *DB) migrateLegacySchema(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit schema migration: %w", err)
+	}
+	return nil
+}
+
+func migrateJobUpdateRuns(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		return fmt.Errorf("create schema migration table: %w", err)
+	}
+
+	var applied int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version = 1").Scan(&applied); err != nil {
+		return fmt.Errorf("check job update run migration: %w", err)
+	}
+	if applied != 0 {
+		return nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE job_update_runs (
+			run_id TEXT PRIMARY KEY,
+			active_slot INTEGER UNIQUE,
+			status TEXT NOT NULL,
+			target_count INTEGER NOT NULL,
+			owner_token TEXT NOT NULL DEFAULT '',
+			fencing_token INTEGER NOT NULL DEFAULT 0,
+			lease_expires_at INTEGER NOT NULL DEFAULT 0,
+			stop_provider TEXT NOT NULL DEFAULT '',
+			stop_status INTEGER NOT NULL DEFAULT 0,
+			stop_reason TEXT NOT NULL DEFAULT '',
+			retry_after_at INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE job_update_targets (
+			run_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			provider TEXT NOT NULL,
+			company_slug TEXT NOT NULL,
+			status TEXT NOT NULL,
+			last_error TEXT NOT NULL DEFAULT '',
+			completed_at TEXT,
+			PRIMARY KEY (run_id, provider, company_slug),
+			UNIQUE (run_id, ordinal)
+		);
+		CREATE INDEX job_update_targets_pending_idx
+			ON job_update_targets(run_id, status, ordinal);
+		INSERT INTO schema_migrations(version) VALUES (1);
+	`); err != nil {
+		return fmt.Errorf("create job update run schema: %w", err)
 	}
 	return nil
 }
@@ -493,6 +554,464 @@ func (d *DB) ClearJobUpdateCheckpoints(ctx context.Context) error {
 	return nil
 }
 
+var (
+	ErrJobUpdateRunActive        = errors.New("a job update run is already active")
+	ErrJobUpdateRunOwnershipLost = errors.New("job update run ownership was lost")
+)
+
+type JobUpdateTarget struct {
+	Provider    string
+	CompanySlug string
+}
+
+type JobUpdateRun struct {
+	ID             string
+	Status         string
+	Resumed        bool
+	OwnerToken     string
+	FencingToken   int64
+	TargetCount    int
+	CompletedCount int
+	PendingCount   int
+	FailedCount    int
+	StopProvider   string
+	StopStatus     int
+	StopReason     string
+	RetryAfterAt   time.Time
+}
+
+type JobUpdateRetryNotBeforeError struct {
+	RetryAt time.Time
+}
+
+func (e *JobUpdateRetryNotBeforeError) Error() string {
+	return fmt.Sprintf("job update is paused until %s", e.RetryAt.Format(time.RFC3339))
+}
+
+// BeginOrResumeJobUpdateRun creates a fixed target snapshot or takes over an
+// interrupted run after its database-backed owner lease expires.
+func (d *DB) BeginOrResumeJobUpdateRun(ctx context.Context, targets []JobUpdateTarget) (*JobUpdateRun, []JobUpdateTarget, error) {
+	ownerToken, err := randomID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("create job update owner token: %w", err)
+	}
+
+	normalized := make([]JobUpdateTarget, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for i, target := range targets {
+		target.Provider = strings.ToLower(strings.TrimSpace(target.Provider))
+		target.CompanySlug = strings.TrimSpace(target.CompanySlug)
+		if target.Provider == "" || target.CompanySlug == "" {
+			return nil, nil, errors.New("job update targets require a provider and company slug")
+		}
+		key := target.Provider + "\x00" + target.CompanySlug
+		if _, ok := seen[key]; ok {
+			return nil, nil, fmt.Errorf("duplicate job update target %s/%s", target.Provider, target.CompanySlug)
+		}
+		seen[key] = struct{}{}
+		normalized[i] = target
+	}
+
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		if d.activeJobUpdateRunExists(ctx) {
+			return nil, nil, ErrJobUpdateRunActive
+		}
+		return nil, nil, fmt.Errorf("begin job update run: %w", err)
+	}
+	defer tx.Rollback()
+
+	var now int64
+	if err := tx.QueryRowContext(ctx, "SELECT CAST(strftime('%s', 'now') AS INTEGER)").Scan(&now); err != nil {
+		return nil, nil, fmt.Errorf("read database time for job update run: %w", err)
+	}
+
+	var runID, status string
+	var currentFence, leaseExpiresAt, retryAfterAt int64
+	resumed := false
+	err = tx.QueryRowContext(ctx, `
+		SELECT run_id, status, fencing_token, lease_expires_at, retry_after_at
+		FROM job_update_runs WHERE active_slot = 1
+	`).Scan(&runID, &status, &currentFence, &leaseExpiresAt, &retryAfterAt)
+	switch {
+	case err == nil:
+		resumed = true
+		if status == "running" && leaseExpiresAt > now {
+			return nil, nil, ErrJobUpdateRunActive
+		}
+		if retryAfterAt > now {
+			return nil, nil, &JobUpdateRetryNotBeforeError{RetryAt: time.Unix(retryAfterAt, 0).UTC()}
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE job_update_runs
+			SET status = 'running', owner_token = ?, fencing_token = fencing_token + 1,
+				lease_expires_at = ? + 60, updated_at = CURRENT_TIMESTAMP
+			WHERE run_id = ? AND active_slot = 1 AND fencing_token = ?
+		`, ownerToken, now, runID, currentFence)
+		if err != nil {
+			return nil, nil, fmt.Errorf("take over interrupted job update run: %w", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return nil, nil, fmt.Errorf("confirm job update run takeover: %w", err)
+		}
+		if changed != 1 {
+			return nil, nil, ErrJobUpdateRunActive
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		runID, err = randomID()
+		if err != nil {
+			return nil, nil, fmt.Errorf("create job update run ID: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM job_update_targets
+			WHERE run_id IN (SELECT run_id FROM job_update_runs WHERE status = 'completed')
+		`); err != nil {
+			return nil, nil, fmt.Errorf("remove old completed job update targets: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM job_update_runs WHERE status = 'completed'"); err != nil {
+			return nil, nil, fmt.Errorf("remove old completed job update runs: %w", err)
+		}
+		legacyDone, err := readLegacyJobUpdateCheckpoints(ctx, tx)
+		if err != nil {
+			return nil, nil, err
+		}
+		resumed = len(legacyDone) > 0
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO job_update_runs (
+				run_id, active_slot, status, target_count, owner_token,
+				fencing_token, lease_expires_at
+			) VALUES (?, 1, 'running', ?, ?, 1, ? + 60)
+		`, runID, len(normalized), ownerToken, now); err != nil {
+			tx.Rollback()
+			if d.activeJobUpdateRunExists(ctx) {
+				return nil, nil, ErrJobUpdateRunActive
+			}
+			return nil, nil, fmt.Errorf("create job update run: %w", err)
+		}
+		for ordinal, target := range normalized {
+			targetStatus := "pending"
+			if _, ok := legacyDone[target.Provider+"\x00"+target.CompanySlug]; ok {
+				targetStatus = "completed"
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO job_update_targets(run_id, ordinal, provider, company_slug, status)
+				VALUES (?, ?, ?, ?, ?)
+			`, runID, ordinal, target.Provider, target.CompanySlug, targetStatus); err != nil {
+				return nil, nil, fmt.Errorf("save job update target %s/%s: %w", target.Provider, target.CompanySlug, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM job_update_checkpoints"); err != nil {
+			return nil, nil, fmt.Errorf("retire legacy job update checkpoints: %w", err)
+		}
+	default:
+		return nil, nil, fmt.Errorf("read active job update run: %w", err)
+	}
+
+	run, err := readJobUpdateRun(ctx, tx, runID)
+	if err != nil {
+		return nil, nil, err
+	}
+	run.Resumed = resumed
+	pending, err := readPendingJobUpdateTargets(ctx, tx, runID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit job update run ownership: %w", err)
+	}
+	return run, pending, nil
+}
+
+func (d *DB) activeJobUpdateRunExists(ctx context.Context) bool {
+	var active int
+	err := d.conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM job_update_runs WHERE active_slot = 1
+	`).Scan(&active)
+	return err == nil && active > 0
+}
+
+// JobUpdateRunProgress returns counts derived from durable run and target state.
+func (d *DB) JobUpdateRunProgress(ctx context.Context, runID string) (*JobUpdateRun, error) {
+	tx, err := d.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("begin job update progress read: %w", err)
+	}
+	defer tx.Rollback()
+	run, err := readJobUpdateRun(ctx, tx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("finish job update progress read: %w", err)
+	}
+	return run, nil
+}
+
+func readLegacyJobUpdateCheckpoints(ctx context.Context, tx *sql.Tx) (map[string]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT provider, company_slug FROM job_update_checkpoints")
+	if err != nil {
+		return nil, fmt.Errorf("read legacy job update checkpoints: %w", err)
+	}
+	defer rows.Close()
+
+	done := make(map[string]struct{})
+	for rows.Next() {
+		var provider, slug string
+		if err := rows.Scan(&provider, &slug); err != nil {
+			return nil, fmt.Errorf("scan legacy job update checkpoint: %w", err)
+		}
+		done[strings.ToLower(strings.TrimSpace(provider))+"\x00"+strings.TrimSpace(slug)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate legacy job update checkpoints: %w", err)
+	}
+	return done, nil
+}
+
+func readJobUpdateRun(ctx context.Context, tx *sql.Tx, runID string) (*JobUpdateRun, error) {
+	run := &JobUpdateRun{ID: runID}
+	var retryAfterAt int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT status, owner_token, fencing_token, target_count, stop_provider,
+			stop_status, stop_reason, retry_after_at
+		FROM job_update_runs WHERE run_id = ?
+	`, runID).Scan(
+		&run.Status, &run.OwnerToken, &run.FencingToken, &run.TargetCount,
+		&run.StopProvider, &run.StopStatus, &run.StopReason, &retryAfterAt,
+	); err != nil {
+		return nil, fmt.Errorf("read job update run %q: %w", runID, err)
+	}
+	if retryAfterAt > 0 {
+		run.RetryAfterAt = time.Unix(retryAfterAt, 0).UTC()
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'pending' AND last_error <> '' THEN 1 ELSE 0 END), 0)
+		FROM job_update_targets WHERE run_id = ?
+	`, runID).Scan(&run.CompletedCount, &run.PendingCount, &run.FailedCount); err != nil {
+		return nil, fmt.Errorf("read job update run progress: %w", err)
+	}
+	return run, nil
+}
+
+func readPendingJobUpdateTargets(ctx context.Context, tx *sql.Tx, runID string) ([]JobUpdateTarget, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT provider, company_slug FROM job_update_targets
+		WHERE run_id = ? AND status = 'pending' ORDER BY ordinal
+	`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("read pending job update targets: %w", err)
+	}
+	defer rows.Close()
+
+	var pending []JobUpdateTarget
+	for rows.Next() {
+		var target JobUpdateTarget
+		if err := rows.Scan(&target.Provider, &target.CompanySlug); err != nil {
+			return nil, fmt.Errorf("scan pending job update target: %w", err)
+		}
+		pending = append(pending, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending job update targets: %w", err)
+	}
+	return pending, nil
+}
+
+func randomID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes[:]), nil
+}
+
+// RenewJobUpdateRunLease extends ownership using database time.
+func (d *DB) RenewJobUpdateRunLease(ctx context.Context, run *JobUpdateRun) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	result, err := d.conn.ExecContext(ctx, `
+		UPDATE job_update_runs
+		SET lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + 60,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE run_id = ? AND status = 'running' AND owner_token = ?
+			AND fencing_token = ?
+			AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+	`, run.ID, run.OwnerToken, run.FencingToken)
+	if err != nil {
+		return fmt.Errorf("renew job update run lease: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm job update run lease: %w", err)
+	}
+	if changed != 1 {
+		return ErrJobUpdateRunOwnershipLost
+	}
+	return nil
+}
+
+// RecordJobUpdateTargetFailure retains a safe diagnostic for a pending target.
+func (d *DB) RecordJobUpdateTargetFailure(ctx context.Context, run *JobUpdateRun, target JobUpdateTarget, category string) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	result, err := d.conn.ExecContext(ctx, `
+		UPDATE job_update_targets
+		SET last_error = ?
+		WHERE run_id = ? AND provider = ? AND company_slug = ? AND status = 'pending'
+			AND EXISTS (
+				SELECT 1 FROM job_update_runs
+				WHERE run_id = ? AND status = 'running' AND owner_token = ? AND fencing_token = ?
+					AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+			)
+	`, category, run.ID, target.Provider, target.CompanySlug, run.ID, run.OwnerToken, run.FencingToken)
+	if err != nil {
+		return fmt.Errorf("record failed job update target %s/%s: %w", target.Provider, target.CompanySlug, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm failed job update target: %w", err)
+	}
+	if changed != 1 {
+		return ErrJobUpdateRunOwnershipLost
+	}
+	return nil
+}
+
+// ReplaceProviderJobsAndCompleteTarget commits refreshed jobs and target state atomically.
+func (d *DB) ReplaceProviderJobsAndCompleteTarget(ctx context.Context, run *JobUpdateRun, target JobUpdateTarget, jobs []Job) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin atomic %s job update for %q: %w", target.Provider, target.CompanySlug, err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE job_update_runs
+		SET lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + 60,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE run_id = ? AND status = 'running' AND owner_token = ? AND fencing_token = ?
+			AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+	`, run.ID, run.OwnerToken, run.FencingToken)
+	if err != nil {
+		return fmt.Errorf("verify job update run ownership: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm job update run ownership: %w", err)
+	}
+	if changed != 1 {
+		return ErrJobUpdateRunOwnershipLost
+	}
+
+	if err := replaceProviderJobsTx(ctx, tx, target.Provider, target.CompanySlug, jobs); err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, `
+		UPDATE job_update_targets
+		SET status = 'completed', last_error = '', completed_at = CURRENT_TIMESTAMP
+		WHERE run_id = ? AND provider = ? AND company_slug = ? AND status = 'pending'
+	`, run.ID, target.Provider, target.CompanySlug)
+	if err != nil {
+		return fmt.Errorf("complete job update target %s/%s: %w", target.Provider, target.CompanySlug, err)
+	}
+	changed, err = result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm job update target completion: %w", err)
+	}
+	if changed != 1 {
+		return fmt.Errorf("job update target %s/%s is not pending", target.Provider, target.CompanySlug)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit atomic %s job update for %q: %w", target.Provider, target.CompanySlug, err)
+	}
+	return nil
+}
+
+// PauseJobUpdateRun releases ownership while retaining the resumable snapshot.
+func (d *DB) PauseJobUpdateRun(ctx context.Context, run *JobUpdateRun, stopProvider string, stopStatus int, stopReason string, retryAfter time.Time) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	retryAt := int64(0)
+	if !retryAfter.IsZero() {
+		retryAt = retryAfter.UTC().Unix()
+	}
+	result, err := d.conn.ExecContext(ctx, `
+		UPDATE job_update_runs
+		SET status = 'paused', owner_token = '', lease_expires_at = 0,
+			stop_provider = ?, stop_status = ?, stop_reason = ?, retry_after_at = ?,
+			last_error = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE run_id = ? AND status = 'running' AND owner_token = ? AND fencing_token = ?
+			AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+	`, stopProvider, stopStatus, stopReason, retryAt, stopReason, run.ID, run.OwnerToken, run.FencingToken)
+	if err != nil {
+		return fmt.Errorf("pause job update run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm job update run pause: %w", err)
+	}
+	if changed != 1 {
+		return ErrJobUpdateRunOwnershipLost
+	}
+	return nil
+}
+
+// CompleteJobUpdateRun retires the active snapshot after every target commits.
+func (d *DB) CompleteJobUpdateRun(ctx context.Context, run *JobUpdateRun) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin job update run completion: %w", err)
+	}
+	defer tx.Rollback()
+	var pending int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM job_update_targets
+		WHERE run_id = ? AND status <> 'completed'
+	`, run.ID).Scan(&pending); err != nil {
+		return fmt.Errorf("check pending job update targets: %w", err)
+	}
+	if pending != 0 {
+		return fmt.Errorf("cannot complete job update run with %d pending targets", pending)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE job_update_runs
+		SET status = 'completed', active_slot = NULL, owner_token = '',
+			lease_expires_at = 0, updated_at = CURRENT_TIMESTAMP
+		WHERE run_id = ? AND status = 'running' AND owner_token = ? AND fencing_token = ?
+			AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+	`, run.ID, run.OwnerToken, run.FencingToken)
+	if err != nil {
+		return fmt.Errorf("complete job update run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm job update run completion: %w", err)
+	}
+	if changed != 1 {
+		return ErrJobUpdateRunOwnershipLost
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM job_update_targets WHERE run_id = ?", run.ID); err != nil {
+		return fmt.Errorf("retire completed job update targets: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit job update run completion: %w", err)
+	}
+	return nil
+}
+
 // Companies returns all known company slugs.
 func (d *DB) Companies(ctx context.Context) ([]string, error) {
 	return d.CompaniesForProvider(ctx, "greenhouse")
@@ -572,6 +1091,16 @@ func (d *DB) ReplaceProviderJobs(ctx context.Context, provider, slug string, job
 	}
 	defer tx.Rollback()
 
+	if err := replaceProviderJobsTx(ctx, tx, provider, slug, jobs); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit %s job update for %q: %w", provider, slug, err)
+	}
+	return nil
+}
+
+func replaceProviderJobsTx(ctx context.Context, tx *sql.Tx, provider, slug string, jobs []Job) error {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM indexed_jobs WHERE provider = ? AND company_slug = ?", provider, slug); err != nil {
 		return fmt.Errorf("remove old %s jobs for %q: %w", provider, slug, err)
 	}
@@ -637,9 +1166,6 @@ func (d *DB) ReplaceProviderJobs(ctx context.Context, provider, slug string, job
 		return fmt.Errorf("refresh saved %s job snapshots for %q: %w", provider, slug, err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit %s job update for %q: %w", provider, slug, err)
-	}
 	return nil
 }
 

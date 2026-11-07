@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,9 +16,6 @@ import (
 	"sync"
 	"time"
 )
-
-// proxyProbeConcurrency bounds simultaneous probe dials at startup.
-const proxyProbeConcurrency = 64
 
 // proxyInUsePollInterval is how often acquire rechecks the pool when a
 // healthy peer is currently leased by another worker.
@@ -42,8 +38,8 @@ type geonodeProxyEntry struct {
 
 // toEntries maps one Geonode record onto the shared entry schema, one
 // entry per supported protocol. Uptime carries the negative response
-// time so the loader's descending sort puts the fastest proxies first;
-// every record is marked alive and left for the health probe to judge.
+// time so the loader's descending sort prefers source-claimed records;
+// this metadata does not verify transport health.
 func (entry geonodeProxyEntry) toEntries() []proxyListEntry {
 	if entry.IP == "" || entry.Port == "" {
 		return nil
@@ -171,19 +167,15 @@ type proxyPoolConfig struct {
 	retryAfterFloor time.Duration
 	// maxCooldown caps any cooldown a peer can be given. Zero disables the cap.
 	maxCooldown time.Duration
-	// allowDirectFallback permits fallback to direct connection when all proxies are evicted.
-	// When false (default), acquire returns an error when pool is exhausted (fail-closed).
-	allowDirectFallback bool
 }
 
 type proxyPool struct {
 	mu      sync.Mutex
 	saveMu  sync.Mutex // serializes save() so flushes never race
 	peers   []*proxyPeer
+	pinned  *proxyPeer
 	healthy int
 	cfg     proxyPoolConfig
-
-	lastFallbackLog time.Time
 }
 
 type proxyOutcome int
@@ -285,13 +277,9 @@ func eligibleProxyEntries(entries []proxyListEntry, uniqueHosts bool) []proxyLis
 	return kept
 }
 
-// loadProxyPool reads a proxy list file, keeps alive elite http/socks5
-// entries ordered by uptime (best first), validates each peer, and keeps
-// only peers that answered within probeTimeout. With a non-empty probeURL
-// each peer receives one real GET through its own proxy client and any
-// HTTP status proves the tunnel reaches the target; with an empty probeURL
-// the probe falls back to a plain TCP dial, which only proves address
-// reachability.
+// loadProxyPool reads a proxy list and pins the highest-ranked eligible
+// entry for the run. Route eligibility is determined from the supplied
+// list only; target endpoints are never contacted to probe proxy candidates.
 func loadProxyPool(
 	ctx context.Context,
 	source string,
@@ -300,9 +288,8 @@ func loadProxyPool(
 	requestTimeout time.Duration,
 	probeURL string,
 ) (*proxyPool, error) {
-	if probeTimeout <= 0 {
-		return nil, errors.New("proxy probe timeout must be greater than 0")
-	}
+	_ = probeTimeout
+	_ = probeURL
 	var entries []proxyListEntry
 	var err error
 	if isProxyListURL(source) {
@@ -314,110 +301,21 @@ func loadProxyPool(
 		return nil, err
 	}
 
-	ordered := make([]*proxyPeer, 0, len(entries))
-	for _, entry := range eligibleProxyEntries(entries, false) {
-		proxyURL, err := url.Parse(entry.Proxy)
-		if err != nil {
-			continue
-		}
-		ordered = append(ordered, &proxyPeer{
-			raw:    entry.Proxy,
-			client: newPeerClient(proxyURL, requestTimeout),
-		})
+	eligible := eligibleProxyEntries(entries, false)
+	if len(eligible) == 0 {
+		return nil, fmt.Errorf("no eligible proxy entries in %s", source)
 	}
 
-	probed := probeProxyPeers(ctx, ordered, probeTimeout, probeURL)
-	if len(probed) == 0 {
-		return nil, fmt.Errorf("no proxy passed the health probe from %s", source)
-	}
-	log.Printf("loaded %d proxies from %s (%d of %d entries passed the health probe)",
-		len(probed), source, len(probed), len(entries))
-
-	return &proxyPool{peers: probed, healthy: len(probed), cfg: cfg}, nil
-}
-
-// probeProxyPeers validates every peer concurrently and returns only the
-// peers that answered, preserving the original order.
-func probeProxyPeers(ctx context.Context, peers []*proxyPeer, timeout time.Duration, probeURL string) []*proxyPeer {
-	dialer := &net.Dialer{Timeout: timeout}
-	jobs := make(chan *proxyPeer)
-	survivors := make([]bool, len(peers))
-	var wg sync.WaitGroup
-	for i := 0; i < proxyProbeConcurrency && i < len(peers); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for peer := range jobs {
-				if probePeer(ctx, dialer, peer, timeout, probeURL) {
-					survivors[indexOfPeer(peers, peer)] = true
-				}
-			}
-		}()
-	}
-	for _, peer := range peers {
-		jobs <- peer
-	}
-	close(jobs)
-	wg.Wait()
-
-	kept := make([]*proxyPeer, 0, len(peers))
-	for i, peer := range peers {
-		if survivors[i] {
-			kept = append(kept, peer)
-		}
-	}
-	return kept
-}
-
-// probePeer validates one peer. A non-empty probeURL sends a real GET
-// through the proxy and any HTTP status (4xx and 5xx included) proves the
-// CONNECT tunnel and TLS handshake work; a transport failure drops the
-// peer. An empty probeURL only dials the proxy address over TCP.
-func probePeer(ctx context.Context, dialer *net.Dialer, peer *proxyPeer, timeout time.Duration, probeURL string) bool {
-	if probeURL == "" {
-		return dialProxyPeer(ctx, dialer, peer.raw) == nil
-	}
-	probeClient := &http.Client{Transport: peer.client.Transport, Timeout: timeout}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	chosen := eligible[0]
+	proxyURL, err := url.Parse(chosen.Proxy)
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("parse selected proxy: %w", err)
 	}
-	res, err := probeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	io.Copy(io.Discard, io.LimitReader(res.Body, 512))
-	res.Body.Close()
-	return true
-}
-
-func indexOfPeer(peers []*proxyPeer, peer *proxyPeer) int {
-	for i, candidate := range peers {
-		if candidate == peer {
-			return i
-		}
-	}
-	return -1
-}
-
-func dialProxyPeer(ctx context.Context, dialer *net.Dialer, raw string) error {
-	proxyURL, err := url.Parse(raw)
-	if err != nil {
-		return err
-	}
-	addr := proxyURL.Host
-	if proxyURL.Port() == "" {
-		if proxyURL.Scheme == "https" {
-			addr += ":443"
-		} else {
-			addr += ":80"
-		}
-	}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return err
-	}
-	return conn.Close()
+	// A selected manual route stays fixed. Pool exhaustion is fail-closed;
+	// never change egress mid-run.
+	peer := &proxyPeer{raw: chosen.Proxy, client: newPeerClient(proxyURL, requestTimeout)}
+	log.Printf("selected one of %d eligible proxies from %s; route is pinned for this run", len(eligible), source)
+	return &proxyPool{peers: []*proxyPeer{peer}, pinned: peer, healthy: 1, cfg: cfg}, nil
 }
 
 // newPeerClient builds an HTTP client pinned to a single proxy URL. The
@@ -448,74 +346,59 @@ func newPeerClient(proxyURL *url.URL, timeout time.Duration) *http.Client {
 	}
 }
 
-// acquire leases a peer exclusively. It blocks until a peer is eligible
-// (idle, past its reuse gap and cooldown) or the context ends. If no
-// healthy peer remains it reports directFallback so callers can send from
-// the local address, and logs the switch (unless fail-closed is active).
+// acquire leases the one pinned peer exclusively. It blocks until that
+// route is available or the context ends. It never rotates to another peer
+// or falls back to direct egress.
 func (p *proxyPool) acquire(ctx context.Context) (*proxyPeer, bool, error) {
 	for {
 		p.mu.Lock()
-		if p.healthy == 0 {
-			p.mu.Unlock()
-			if !p.cfg.allowDirectFallback {
-				return nil, false, errors.New("proxy pool exhausted: all healthy proxies evicted (fail-closed to protect host IP)")
+		if p.pinned == nil {
+			for _, peer := range p.peers {
+				if !peer.evicted {
+					p.pinned = peer
+					break
+				}
 			}
-			p.warnDirectFallback()
-			return nil, true, nil
+		}
+		peer := p.pinned
+		if peer == nil || peer.evicted {
+			p.mu.Unlock()
+			return nil, false, errors.New("pinned proxy route is unavailable; refusing to change egress")
 		}
 		now := time.Now()
-		var best *proxyPeer
-		next := time.Duration(0)
-		nextSet := false
-		anyLeased := false
-		for _, peer := range p.peers {
-			if peer.evicted {
-				continue
-			}
-			if peer.inUse {
-				anyLeased = true
-				continue
-			}
+		if !peer.inUse {
 			ready := peer.lastUsed.Add(p.cfg.minReuseGap)
 			if peer.cooldownUntil.After(ready) {
 				ready = peer.cooldownUntil
 			}
-			if wait := ready.Sub(now); wait > 0 {
-				if !nextSet || wait < next {
-					next, nextSet = wait, true
-				}
-				continue
+			wait := ready.Sub(now)
+			if wait <= 0 {
+				peer.inUse = true
+				p.mu.Unlock()
+				return peer, false, nil
 			}
-			if best == nil || peer.lastUsed.Before(best.lastUsed) {
-				best = peer
-			}
-		}
-		if best != nil {
-			best.inUse = true
 			p.mu.Unlock()
-			return best, false, nil
-		}
-		wait := next
-		if anyLeased {
-			wait = proxyInUsePollInterval
+			if err := waitContext(ctx, wait); err != nil {
+				return nil, false, err
+			}
+			continue
 		}
 		p.mu.Unlock()
 
-		if wait <= 0 {
-			wait = proxyInUsePollInterval
+		if err := waitContext(ctx, proxyInUsePollInterval); err != nil {
+			return nil, false, err
 		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return nil, false, ctx.Err()
-		}
+	}
+}
+
+func waitContext(ctx context.Context, wait time.Duration) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -693,48 +576,12 @@ func flushProxyList(ctx context.Context, pool *proxyPool, path string) {
 	}
 }
 
-// collectCandidate is one proxy under consideration in collect mode with
-// the client used for probe rounds and the stats observed so far.
 type collectCandidate struct {
-	entry     proxyListEntry
-	client    *http.Client
-	successes int
-	failures  int
-	latencyMS float64
-	latencyN  int
+	entry proxyListEntry
 }
 
-// probe once through the candidate. A non-empty probeURL sends a GET
-// through the proxy — any HTTP status proves the tunnel — otherwise a
-// TCP dial is timed instead. Returns success and the elapsed duration.
-func (c *collectCandidate) probe(ctx context.Context, probeURL string, timeout time.Duration) (bool, time.Duration) {
-	if probeURL == "" {
-		start := time.Now()
-		err := dialProxyPeer(ctx, &net.Dialer{Timeout: timeout}, c.entry.Proxy)
-		return err == nil, time.Since(start)
-	}
-	client := &http.Client{Transport: c.client.Transport, Timeout: timeout}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
-	if err != nil {
-		return false, 0
-	}
-	start := time.Now()
-	res, err := client.Do(req)
-	elapsed := time.Since(start)
-	if err != nil {
-		return false, elapsed
-	}
-	io.Copy(io.Discard, io.LimitReader(res.Body, 512))
-	res.Body.Close()
-	return true, elapsed
-}
-
-// collectProxies curation mode: pull candidates from every source (file
-// or http(s) URL), probe each one `iterations` times through probeURL
-// with the shared probe concurrency, drop everything that never
-// answered, and write the curated list to output. With uniqueHosts only
-// the best entry per host survives, which saves probes when one provider
-// exposes the same egress IP on many ports.
+// collectProxies reads and normalizes user-supplied proxy lists without
+// probing candidate routes against a destination provider.
 func collectProxies(
 	ctx context.Context,
 	output string,
@@ -748,6 +595,8 @@ func collectProxies(
 	if probeTimeout <= 0 {
 		return errors.New("proxy probe timeout must be greater than 0")
 	}
+	_ = iterations
+	_ = probeURL
 	entries := make([]proxyListEntry, 0)
 	for _, source := range sources {
 		var sourceEntries []proxyListEntry
@@ -773,125 +622,51 @@ func collectProxies(
 
 	candidates := make([]*collectCandidate, 0, len(entries))
 	for _, entry := range eligibleProxyEntries(entries, uniqueHosts) {
-		proxyURL, err := url.Parse(entry.Proxy)
-		if err != nil {
-			continue
-		}
 		candidates = append(candidates, &collectCandidate{
-			entry:  entry,
-			client: newPeerClient(proxyURL, probeTimeout),
+			entry: entry,
 		})
 	}
 	if len(candidates) == 0 {
 		return errors.New("no eligible proxy candidates after filtering the given sources")
 	}
 
-	curated, err := curateProxies(ctx, candidates, iterations, probeTimeout, probeURL)
+	curated, err := curateProxies(ctx, candidates)
 	if err != nil {
 		return err
 	}
 	if err := writeProxyList(output, curated); err != nil {
 		return fmt.Errorf("write proxy list %s: %w", output, err)
 	}
-	log.Printf("collected %d proxies from %d candidate(s) after %d probe round(s) -> %s",
-		len(curated), len(candidates), iterations, output)
+	log.Printf("saved %d eligible proxy candidates (not transport-verified) -> %s",
+		len(curated), output)
 	return nil
 }
 
-// curateProxies runs the probe rounds over the candidates, keeps anything
-// that answered at least once, and returns save entries ordered by
-// successes descending, then measured response time, then proxy URL.
-// Candidates are mutated, so callers must not share them concurrently.
-func curateProxies(ctx context.Context, candidates []*collectCandidate, iterations int, probeTimeout time.Duration, probeURL string) ([]proxySaveEntry, error) {
-	for round := 1; round <= iterations; round++ {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		collectSweep(ctx, candidates, probeTimeout, probeURL)
-		answered := 0
-		for _, candidate := range candidates {
-			if candidate.successes > 0 {
-				answered++
-			}
-		}
-		log.Printf("probe round %d/%d done: %d/%d answered so far", round, iterations, answered, len(candidates))
+// curateProxies serializes eligible source entries without sending target
+// requests. Source health fields remain claims, not transport verification.
+func curateProxies(ctx context.Context, candidates []*collectCandidate) ([]proxySaveEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-
-	survivors := make([]*collectCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate.successes > 0 {
-			survivors = append(survivors, candidate)
-		}
+	if len(candidates) == 0 {
+		return nil, errors.New("no eligible proxy candidates")
 	}
-	if len(survivors) == 0 {
-		return nil, fmt.Errorf("no proxy answered any of %d probe round(s)", iterations)
-	}
-	sort.SliceStable(survivors, func(i, j int) bool {
-		a, b := survivors[i], survivors[j]
-		if a.successes != b.successes {
-			return a.successes > b.successes
-		}
-		if a.averageLatency() != b.averageLatency() {
-			return a.averageLatency() < b.averageLatency()
-		}
-		return a.entry.Proxy < b.entry.Proxy
+	sorted := append([]*collectCandidate(nil), candidates...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].entry.Proxy < sorted[j].entry.Proxy
 	})
 
-	saved := make([]proxySaveEntry, 0, len(survivors))
-	now := time.Now().UTC().Format(time.RFC3339)
-	for _, candidate := range survivors {
-		if candidate.latencyN > 0 {
-			candidate.latencyMS = candidate.latencyMS / float64(candidate.latencyN)
-		}
+	saved := make([]proxySaveEntry, 0, len(sorted))
+	for _, candidate := range sorted {
 		saved = append(saved, proxySaveEntry{
-			Proxy:      candidate.entry.Proxy,
-			Protocol:   candidate.entry.Protocol,
-			Anonymity:  candidate.entry.Anonymity,
-			Alive:      true,
-			Uptime:     float64(candidate.successes),
-			Requests:   candidate.successes + candidate.failures,
-			Successes:  candidate.successes,
-			Failures:   candidate.failures,
-			ResponseMs: candidate.latencyMS,
-			LastUsed:   now,
+			Proxy:     candidate.entry.Proxy,
+			Protocol:  candidate.entry.Protocol,
+			Anonymity: candidate.entry.Anonymity,
+			Alive:     candidate.entry.Alive,
+			Uptime:    candidate.entry.Uptime,
 		})
 	}
 	return saved, nil
-}
-
-// collectSweep probes every candidate once, concurrently.
-func collectSweep(ctx context.Context, candidates []*collectCandidate, probeTimeout time.Duration, probeURL string) {
-	jobs := make(chan *collectCandidate)
-	var wg sync.WaitGroup
-	for i := 0; i < proxyProbeConcurrency && i < len(candidates); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for candidate := range jobs {
-				ok, elapsed := candidate.probe(ctx, probeURL, probeTimeout)
-				if ok {
-					candidate.successes++
-					candidate.latencyMS += float64(elapsed) / float64(time.Millisecond)
-					candidate.latencyN++
-				} else {
-					candidate.failures++
-				}
-			}
-		}()
-	}
-	for _, candidate := range candidates {
-		jobs <- candidate
-	}
-	close(jobs)
-	wg.Wait()
-}
-
-// averageLatency returns the mean probe latency in milliseconds.
-func (c *collectCandidate) averageLatency() float64 {
-	if c.latencyN == 0 {
-		return 0
-	}
-	return c.latencyMS / float64(c.latencyN)
 }
 
 // progressNote summarizes pool health for the brute-force progress line,
@@ -911,27 +686,12 @@ func (p *proxyPool) progressNote() string {
 	return fmt.Sprintf(", %d/%d proxy peers healthy", p.healthy, len(p.peers)-evicted)
 }
 
-// warnDirectFallback logs switching to the direct connection, at most once
-// per 30 seconds, so switches stay auditable without flooding the log.
-func (p *proxyPool) warnDirectFallback() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if time.Since(p.lastFallbackLog) < 30*time.Second {
-		return
-	}
-	p.lastFallbackLog = time.Now()
-	log.Printf("proxy pool has no healthy peers; falling back to direct connection")
-}
-
 // requestLease ties one HTTP request to the peer that serves it. Proxies
-// off (nil pool) and direct fallback both yield a lease whose client is
-// the direct client; directFallback records which case, so callers can
-// keep direct-mode rate-limit handling when the pool is drained.
+// off (nil pool) yields a lease using the configured direct client.
 type requestLease struct {
-	pool           *proxyPool
-	peer           *proxyPeer
-	client         *http.Client
-	directFallback bool
+	pool   *proxyPool
+	peer   *proxyPeer
+	client *http.Client
 }
 
 func acquireLease(ctx context.Context, pool *proxyPool, client *http.Client) (requestLease, error) {
@@ -943,7 +703,7 @@ func acquireLease(ctx context.Context, pool *proxyPool, client *http.Client) (re
 		return requestLease{}, err
 	}
 	if direct {
-		return requestLease{client: client, directFallback: true}, nil
+		return requestLease{client: client}, nil
 	}
 	return requestLease{pool: pool, peer: peer, client: peer.client}, nil
 }

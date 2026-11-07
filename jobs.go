@@ -80,62 +80,217 @@ func updateAllJobs(
 			targets = append(targets, companyTarget{provider: provider, slug: slug})
 		}
 	}
-	return updateJobTargets(ctx, database, targets, workers, func(ctx context.Context, target companyTarget) (int, error) {
-		return updateProviderCompanyJobs(ctx, database, client, pool, limiter, target.provider, target.slug)
+
+	runTargets := make([]db.JobUpdateTarget, len(targets))
+	for i, target := range targets {
+		runTargets[i] = db.JobUpdateTarget{Provider: target.provider, CompanySlug: target.slug}
+	}
+	run, pending, err := database.BeginOrResumeJobUpdateRun(ctx, runTargets)
+	if err != nil {
+		var retry *db.JobUpdateRetryNotBeforeError
+		switch {
+		case errors.Is(err, db.ErrJobUpdateRunActive):
+			return fmt.Errorf("job update already in progress: %w", err)
+		case errors.As(err, &retry):
+			return fmt.Errorf("%w; no provider requests were sent", err)
+		default:
+			return err
+		}
+	}
+
+	action := "started"
+	if run.Resumed {
+		action = "resuming"
+	}
+	log.Printf("Job update %s (run %s): %d/%d companies complete, %d pending",
+		action, run.ID, run.CompletedCount, run.TargetCount, run.PendingCount)
+	if run.TargetCount == 0 {
+		log.Printf("No companies to update; discover companies first")
+	}
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	heartbeatCtx, cancelHeartbeat := context.WithCancel(context.Background())
+	heartbeatDone := make(chan struct{})
+	heartbeatErr := make(chan error, 1)
+	go heartbeatJobUpdateRun(heartbeatCtx, cancelRun, database, run, heartbeatDone, heartbeatErr)
+
+	updateErr := updateJobTargets(runCtx, database, run, pending, workers, func(ctx context.Context, target companyTarget) ([]db.Job, error) {
+		return fetchProviderCompanyJobs(ctx, client, pool, limiter, target.provider, target.slug)
 	})
+	cancelHeartbeat()
+	<-heartbeatDone
+	select {
+	case err := <-heartbeatErr:
+		if updateErr == nil || errors.Is(updateErr, context.Canceled) {
+			updateErr = fmt.Errorf("job update lease lost: %w", err)
+		}
+	default:
+	}
+
+	progress, progressErr := database.JobUpdateRunProgress(ctx, run.ID)
+	if progressErr != nil {
+		updateErr = errors.Join(updateErr, progressErr)
+	}
+	if updateErr != nil || progressErr != nil {
+		var stop *providerStopError
+		stopProvider, stopStatus, stopReason := "", 0, "update interrupted; pending targets remain"
+		var retryAt time.Time
+		if errors.As(updateErr, &stop) {
+			stopProvider, stopStatus, stopReason, retryAt = stop.provider, stop.status, stop.reason, stop.retryAt
+		}
+		pauseCtx, cancelPause := context.WithTimeout(context.Background(), 10*time.Second)
+		pauseErr := database.PauseJobUpdateRun(pauseCtx, run, stopProvider, stopStatus, stopReason, retryAt)
+		cancelPause()
+		if progress != nil {
+			log.Printf("Job update paused (run %s): %d/%d companies complete, %d pending, %d failed",
+				run.ID, progress.CompletedCount, progress.TargetCount, progress.PendingCount, progress.FailedCount)
+		}
+		if stop != nil {
+			if !retryAt.IsZero() {
+				log.Printf("Provider %s stopped after HTTP %d; retry no earlier than %s. Rerun --update --jobs after that time to resume.",
+					stopProvider, stopStatus, retryAt.Format(time.RFC3339))
+			} else {
+				log.Printf("Provider %s stopped after HTTP %d; Retry-After is unavailable. Follow the provider's access policy, then rerun --update --jobs to resume.",
+					stopProvider, stopStatus)
+			}
+		}
+		return errors.Join(updateErr, pauseErr)
+	}
+	if progress.PendingCount != 0 {
+		err := fmt.Errorf("job update stopped with %d pending targets but no worker error", progress.PendingCount)
+		pauseCtx, cancelPause := context.WithTimeout(context.Background(), 10*time.Second)
+		pauseErr := database.PauseJobUpdateRun(pauseCtx, run, "", 0, "update stopped with pending targets", time.Time{})
+		cancelPause()
+		return errors.Join(err, pauseErr)
+	}
+	if err := database.CompleteJobUpdateRun(ctx, run); err != nil {
+		pauseCtx, cancelPause := context.WithTimeout(context.Background(), 10*time.Second)
+		pauseErr := database.PauseJobUpdateRun(pauseCtx, run, "", 0, "could not finalize job update run", time.Time{})
+		cancelPause()
+		return errors.Join(fmt.Errorf("complete job update run: %w", err), pauseErr)
+	}
+	log.Printf("Job update completed (run %s): %d/%d companies complete", run.ID, progress.CompletedCount, progress.TargetCount)
+	return nil
+}
+
+func heartbeatJobUpdateRun(
+	ctx context.Context,
+	cancelRun context.CancelFunc,
+	database *db.DB,
+	run *db.JobUpdateRun,
+	done chan<- struct{},
+	failures chan<- error,
+) {
+	defer close(done)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	lastCompleted := run.CompletedCount
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			heartbeatCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := database.RenewJobUpdateRunLease(heartbeatCtx, run)
+			if err == nil {
+				var progress *db.JobUpdateRun
+				progress, err = database.JobUpdateRunProgress(heartbeatCtx, run.ID)
+				if err == nil && progress.CompletedCount != lastCompleted {
+					lastCompleted = progress.CompletedCount
+					log.Printf("Job update progress (run %s): %d/%d companies complete, %d pending",
+						run.ID, progress.CompletedCount, progress.TargetCount, progress.PendingCount)
+				}
+			}
+			cancel()
+			if err != nil {
+				select {
+				case failures <- err:
+				default:
+				}
+				cancelRun()
+				return
+			}
+		}
+	}
 }
 
 func updateJobTargets(
 	ctx context.Context,
 	database *db.DB,
-	targets []companyTarget,
+	run *db.JobUpdateRun,
+	pending []db.JobUpdateTarget,
 	workers int,
-	update func(context.Context, companyTarget) (int, error),
+	update func(context.Context, companyTarget) ([]db.Job, error),
 ) error {
-	completed, err := database.JobUpdateCheckpoints(ctx)
-	if err != nil {
-		return err
-	}
-	completedSet := make(map[companyTarget]struct{}, len(completed))
-	for _, checkpoint := range completed {
-		completedSet[companyTarget{provider: checkpoint.Provider, slug: checkpoint.CompanySlug}] = struct{}{}
+	if workers < 1 {
+		return errors.New("job update worker count must be at least one")
 	}
 
-	pending := make([]companyTarget, 0, len(targets))
-	for _, target := range targets {
-		if _, done := completedSet[target]; !done {
-			pending = append(pending, target)
-		}
-	}
-	if len(pending) == 0 {
-		if len(targets) == 0 {
-			log.Printf("No companies to update; discover companies first")
-		} else {
-			log.Printf("All %d company job updates were already checkpointed", len(targets))
-		}
-		return database.ClearJobUpdateCheckpoints(ctx)
-	}
-
-	jobs := make(chan companyTarget)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan db.JobUpdateTarget)
 	errs := make(chan error, len(pending))
 	var wg sync.WaitGroup
+	var stopMu sync.Mutex
+	var stopErr error
+	var fatalErr error
+	recordFatal := func(err error) {
+		stopMu.Lock()
+		if fatalErr == nil {
+			fatalErr = err
+		}
+		stopMu.Unlock()
+		cancel()
+	}
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for target := range jobs {
-				count, err := update(ctx, target)
+				if runCtx.Err() != nil {
+					continue
+				}
+				company := companyTarget{provider: target.Provider, slug: target.CompanySlug}
+				updatedJobs, err := update(runCtx, company)
 				if err != nil {
-					log.Printf("%s/%s: job update failed: %v", target.provider, target.slug, err)
+					var stop *providerStopError
+					if errors.As(err, &stop) {
+						if recordErr := recordJobUpdateTargetFailure(database, run, target, "destination stop"); recordErr != nil {
+							recordFatal(fmt.Errorf("persist destination stop progress: %w", recordErr))
+							continue
+						}
+						errs <- err
+						stopMu.Lock()
+						if stopErr == nil {
+							stopErr = stop
+							cancel()
+						}
+						stopMu.Unlock()
+						continue
+					}
+					if runCtx.Err() != nil {
+						if recordErr := recordJobUpdateTargetFailure(database, run, target, "request interrupted"); recordErr != nil {
+							recordFatal(fmt.Errorf("persist interrupted target progress: %w", recordErr))
+						}
+						continue
+					}
+					if recordErr := recordJobUpdateTargetFailure(database, run, target, jobUpdateErrorCategory(err)); recordErr != nil {
+						recordFatal(fmt.Errorf("persist failed target progress: %w", recordErr))
+						continue
+					}
+					log.Printf("%s/%s: job update failed: %v", target.Provider, target.CompanySlug, err)
 					errs <- err
 					continue
 				}
-				if err := database.SaveJobUpdateCheckpoint(ctx, target.provider, target.slug); err != nil {
-					log.Printf("%s/%s: could not save job update checkpoint: %v", target.provider, target.slug, err)
-					errs <- err
+				if runCtx.Err() != nil {
 					continue
 				}
-				log.Printf("%s/%s: indexed %d jobs", target.provider, target.slug, count)
+				if err := database.ReplaceProviderJobsAndCompleteTarget(runCtx, run, target, updatedJobs); err != nil {
+					recordFatal(fmt.Errorf("save %s/%s job update atomically: %w", target.Provider, target.CompanySlug, err))
+					continue
+				}
+				log.Printf("%s/%s: indexed %d jobs", target.Provider, target.CompanySlug, len(updatedJobs))
 			}
 		}()
 	}
@@ -144,7 +299,7 @@ sendCompanies:
 	for _, target := range pending {
 		select {
 		case jobs <- target:
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			break sendCompanies
 		}
 	}
@@ -152,7 +307,7 @@ sendCompanies:
 	wg.Wait()
 	close(errs)
 
-	failed := 0
+	var failed int
 	var firstErr error
 	for err := range errs {
 		failed++
@@ -160,27 +315,50 @@ sendCompanies:
 			firstErr = err
 		}
 	}
+	stopMu.Lock()
+	stopped := stopErr
+	fatal := fatalErr
+	stopMu.Unlock()
+	if fatal != nil {
+		return fatal
+	}
+	if stopped != nil {
+		return stopped
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d company job updates failed: %w", failed, len(pending), firstErr)
 	}
-	if err := database.ClearJobUpdateCheckpoints(ctx); err != nil {
-		return err
-	}
 	return nil
 }
 
-func updateProviderCompanyJobs(
+func jobUpdateErrorCategory(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "request timed out"
+	}
+	return "provider request failed"
+}
+
+func recordJobUpdateTargetFailure(database *db.DB, run *db.JobUpdateRun, target db.JobUpdateTarget, category string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return database.RecordJobUpdateTargetFailure(ctx, run, target, category)
+}
+
+func fetchProviderCompanyJobs(
 	ctx context.Context,
-	database *db.DB,
 	client *http.Client,
 	pool *proxyPool,
 	limiter *requestLimiter,
 	provider, slug string,
-) (int, error) {
-	return updateProviderJobs(ctx, database, client, pool, limiter, provider, slug)
+) ([]db.Job, error) {
+	implementation, err := getProvider(provider)
+	if err != nil {
+		return nil, err
+	}
+	return implementation.FetchJobs(ctx, client, pool, limiter, slug)
 }
 
 func updateCompanyJobs(
@@ -212,17 +390,16 @@ func fetchGreenhouseJobs(
 	backoff := 500 * time.Millisecond
 	var response *greenhouseResponse
 
-	transientAttempts := 0
-	rateLimitAttempts := 0
-	const maxTransientAttempts = 4
-	const maxRateLimitAttempts = 4
-
-	for {
+	lastFailure := ""
+	for attempt := 0; attempt < 4; attempt++ {
+		if stop := limiter.providerStop(providerGreenhouse); stop != nil {
+			return nil, stop
+		}
 		lease, leaseErr := acquireLease(ctx, pool, client)
 		if leaseErr != nil {
 			return nil, leaseErr
 		}
-		if err := limiter.Wait(ctx); err != nil {
+		if err := limiter.waitForProvider(ctx, providerGreenhouse); err != nil {
 			lease.release(proxyOutcomeFailed, 0)
 			return nil, err
 		}
@@ -238,45 +415,21 @@ func fetchGreenhouseJobs(
 				res.Body.Close()
 			}
 			lease.release(proxyOutcomeFailed, 0)
-			transientAttempts++
-			if transientAttempts >= maxTransientAttempts {
-				return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-			}
+			lastFailure = fmt.Sprintf("transport error: %v", err)
 		} else {
-			if isGreenhouseRateLimited(res.StatusCode) {
+			if isDestinationStopResponse(res) {
 				res.Body.Close()
-				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
-				lease.release(proxyOutcomeRateLimited, retryAfter)
-				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
-				rateLimitAttempts++
-				if pool != nil && !lease.directFallback {
-					// Rate limiting is per egress IP; rotate to a fresh peer.
-					if rateLimitAttempts >= maxRateLimitAttempts {
-						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-					}
-					continue
+				stop := destinationStopError(providerGreenhouse, res)
+				if res.StatusCode == http.StatusTooManyRequests {
+					lease.release(proxyOutcomeRateLimited, stop.retryAfter)
+				} else {
+					lease.release(proxyOutcomeFailed, 0)
 				}
-				cooldownDuration := limiter.StartCooldownForStatusAndRetryAfter("greenhouse", res.StatusCode, retryAfter)
-				if cooldownDuration > 0 {
-					if rateLimitAttempts >= maxRateLimitAttempts {
-						return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-					}
-					if err := limiter.Wait(ctx); err != nil {
-						return nil, err
-					}
-					continue
-				}
-				if rateLimitAttempts >= maxRateLimitAttempts {
-					return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-				}
+				return nil, limiter.stopProvider(stop)
 			} else if res.StatusCode >= 500 {
 				res.Body.Close()
 				lease.release(proxyOutcomeFailed, 0)
-				err = fmt.Errorf("jobs endpoint returned status %d", res.StatusCode)
-				transientAttempts++
-				if transientAttempts >= maxTransientAttempts {
-					return nil, fmt.Errorf("fetch jobs after retries: %w", err)
-				}
+				lastFailure = fmt.Sprintf("status %d", res.StatusCode)
 			} else if res.StatusCode != http.StatusOK {
 				res.Body.Close()
 				lease.release(proxyOutcomeFailed, 0)
@@ -308,6 +461,9 @@ func fetchGreenhouseJobs(
 				response = &parsed
 				break
 			}
+		}
+		if attempt == 3 {
+			return nil, fmt.Errorf("fetch jobs after retries (last: %s)", lastFailure)
 		}
 
 		select {

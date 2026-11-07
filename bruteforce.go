@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -32,6 +33,9 @@ type checkPool struct {
 	pending int
 
 	ctx      context.Context
+	cancel   context.CancelFunc
+	stopMu   sync.Mutex
+	stopErr  error
 	client   *http.Client
 	proxies  *proxyPool
 	limiter  *requestLimiter
@@ -42,10 +46,12 @@ type checkPool struct {
 }
 
 func newCheckPool(ctx context.Context, client *http.Client, proxies *proxyPool, limiter *requestLimiter, database *db.DB, stats *benchmarkStats, provider string, workers int) *checkPool {
+	poolCtx, cancel := context.WithCancel(ctx)
 	pool := &checkPool{
 		jobs:     make(chan string, checkQueueSize),
 		results:  make(chan checkResult, workers),
-		ctx:      ctx,
+		ctx:      poolCtx,
+		cancel:   cancel,
 		client:   client,
 		proxies:  proxies,
 		limiter:  limiter,
@@ -58,7 +64,11 @@ func newCheckPool(ctx context.Context, client *http.Client, proxies *proxyPool, 
 		go func() {
 			defer pool.wg.Done()
 			for slug := range pool.jobs {
+				if pool.providerStop() != nil {
+					continue
+				}
 				err := checkProviderCompany(pool.ctx, pool.client, pool.proxies, pool.limiter, pool.database, pool.provider, slug, pool.stats)
+				pool.noteProviderStop(err)
 				if pool.stats != nil {
 					pool.stats.recordCheck(err != nil)
 				}
@@ -82,8 +92,30 @@ func newCheckPool(ctx context.Context, client *http.Client, proxies *proxyPool, 
 	return pool
 }
 
+func (p *checkPool) noteProviderStop(err error) {
+	var stop *providerStopError
+	if !errors.As(err, &stop) {
+		return
+	}
+	p.stopMu.Lock()
+	if p.stopErr == nil {
+		p.stopErr = stop
+		p.cancel()
+	}
+	p.stopMu.Unlock()
+}
+
+func (p *checkPool) providerStop() error {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	return p.stopErr
+}
+
 // submit queues a check using a continuous sliding window so workers never starve at batch barriers.
 func (p *checkPool) submit(slug string) (int, bool) {
+	if p.providerStop() != nil {
+		return 0, false
+	}
 	// Opportunistically drain any finished results to keep the pipeline moving
 	for {
 		select {
@@ -161,6 +193,7 @@ func (p *checkPool) close() int {
 	failures := p.flush()
 	close(p.jobs)
 	p.wg.Wait()
+	p.cancel()
 	for {
 		select {
 		case result := <-p.results:
@@ -224,6 +257,9 @@ func runBruteForce(
 			}
 		}
 		pool.flush()
+		if stop := pool.providerStop(); stop != nil {
+			return stop
+		}
 		failed := pool.takeFailures()
 
 		// Tier 3: In-flight batch requeue.
@@ -240,6 +276,9 @@ func runBruteForce(
 				}
 			}
 			pool.flush()
+			if stop := pool.providerStop(); stop != nil {
+				return stop
+			}
 			failed = pool.takeFailures()
 		}
 

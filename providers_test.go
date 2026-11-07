@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -159,31 +160,31 @@ func TestWorkableProviderChecksAndIndexesJobs(t *testing.T) {
 	}
 }
 
-func TestWorkable429StartsSharedCooldownBeforeRetry(t *testing.T) {
+func TestWorkable429StopsWithoutRetry(t *testing.T) {
 	const cooldown = 80 * time.Millisecond
 	requests := 0
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		requests++
-		if requests == 1 {
-			return providerResponse(req, http.StatusTooManyRequests, ""), nil
-		}
-		return providerResponse(req, http.StatusOK, `{"name":"Example","jobs":[]}`), nil
+		return providerResponse(req, http.StatusTooManyRequests, ""), nil
 	})}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
 
 	started := time.Now()
 	found, err := (workableProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, errProviderStopped) {
+		t.Fatalf("check error = %v, want provider stop", err)
 	}
-	if !found {
-		t.Fatal("Workable company was not found after the retry")
+	if found {
+		t.Fatal("Workable company was found after a 429")
 	}
-	if requests != 2 {
-		t.Fatalf("made %d requests, want 2", requests)
+	if requests != 1 {
+		t.Fatalf("made %d requests, want 1", requests)
 	}
-	if elapsed := time.Since(started); elapsed < cooldown {
-		t.Fatalf("retry completed after %s, before the %s cooldown", elapsed, cooldown)
+	if elapsed := time.Since(started); elapsed >= cooldown {
+		t.Fatalf("stop waited %s for a retry cooldown", elapsed)
+	}
+	if limiter.providerStop(providerWorkable) == nil {
+		t.Fatal("provider-wide stop was not recorded")
 	}
 }
 
@@ -272,33 +273,28 @@ func providerResponse(req *http.Request, status int, body string) *http.Response
 	}
 }
 
-func TestGreenhouseThrottlingStatusesEnterCooldown(t *testing.T) {
+func TestGreenhouseRestrictionStatusesStopWithoutRetry(t *testing.T) {
 	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable, http.StatusTooManyRequests} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			const cooldown = 80 * time.Millisecond
 			requests := 0
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				requests++
-				if requests == 1 {
-					return providerResponse(req, status, ""), nil
-				}
-				return providerResponse(req, http.StatusOK, ""), nil
+				return providerResponse(req, status, ""), nil
 			})}
-			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
+			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
-			started := time.Now()
 			found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
-			if err != nil {
-				t.Fatal(err)
+			if !errors.Is(err, errProviderStopped) {
+				t.Fatalf("check error = %v, want provider stop", err)
 			}
-			if !found {
-				t.Fatal("Greenhouse company was not found after retry")
+			if found {
+				t.Fatal("Greenhouse company was found after a restriction response")
 			}
-			if requests != 2 {
-				t.Fatalf("made %d requests, want 2", requests)
+			if requests != 1 {
+				t.Fatalf("made %d requests, want 1", requests)
 			}
-			if elapsed := time.Since(started); elapsed < cooldown {
-				t.Fatalf("retry completed after %s, before the %s cooldown", elapsed, cooldown)
+			if limiter.providerStop(providerGreenhouse) == nil {
+				t.Fatal("provider-wide stop was not recorded")
 			}
 		})
 	}
@@ -324,17 +320,39 @@ func TestGenericProvidersDoNotEnterCooldownOn403Or406(t *testing.T) {
 				limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
 				started := time.Now()
 				found, err := p.CheckCompany(context.Background(), client, nil, limiter, "example", nil)
-				if err == nil {
-					t.Fatalf("expected error for status %d, got found=%t", status, found)
+				if !errors.Is(err, errProviderStopped) || found {
+					t.Fatalf("found=%t err=%v; want provider stop for status %d", found, err, status)
 				}
 				if requests != 1 {
 					t.Fatalf("made %d requests, want 1", requests)
+				}
+				if limiter.providerStop(p.Name()) == nil {
+					t.Fatal("provider-wide stop was not recorded")
 				}
 				if elapsed := time.Since(started); elapsed >= cooldown {
 					t.Fatalf("%s provider erroneously entered cooldown: took %s", p.Name(), elapsed)
 				}
 			})
 		}
+	}
+}
+
+func TestGenericProviderStopsOnExplicitChallengeHeader(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		res := providerResponse(req, http.StatusOK, "")
+		res.Header.Set("CF-Mitigated", "challenge")
+		return res, nil
+	})}
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
+
+	found, err := (workableProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+	if !errors.Is(err, errProviderStopped) || found {
+		t.Fatalf("found=%t err=%v; want provider stop", found, err)
+	}
+	if requests != 1 || limiter.providerStop(providerWorkable) == nil {
+		t.Fatalf("requests=%d provider stop=%v, want one request and a recorded stop", requests, limiter.providerStop(providerWorkable))
 	}
 }
 
@@ -380,4 +398,17 @@ func TestRequestLimiterHonorsRetryAfter(t *testing.T) {
 	}
 }
 
+func TestProviderStopErrorReportsFixedRetryTime(t *testing.T) {
+	retryAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	stop := &providerStopError{
+		provider:   providerGreenhouse,
+		status:     http.StatusTooManyRequests,
+		retryAfter: time.Minute,
+		retryAt:    retryAt,
+		reason:     "rate limit",
+	}
 
+	if got := stop.Error(); !strings.Contains(got, retryAt.Format(time.RFC3339)) {
+		t.Fatalf("provider stop error = %q, want fixed retry time %s", got, retryAt.Format(time.RFC3339))
+	}
+}

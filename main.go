@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 
 	"db"
@@ -26,17 +27,38 @@ import (
 
 const baseURL = "https://boards-api.greenhouse.io/v1/boards/%s"
 
-// Global slug length bounds, used for brute-force generation and
-// to filter wordlist-derived candidates. Overridable via flags.
-var (
-	minSlugLength = 4
-	maxSlugLength = 5
-)
-
 var (
 	alphabet = "abcdefghijklmnopqrstuvwxyz"
 	nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
 )
+
+type cliOptions struct {
+	words               string
+	brute               bool
+	bench               bool
+	providerFlags       map[string]*bool
+	resume              bool
+	update              bool
+	updateJobs          bool
+	browse              bool
+	browseAddress       string
+	workers             int
+	rps                 float64
+	requestTimeout      time.Duration
+	cooldown            time.Duration
+	proxiesPath         string
+	proxyReuseGap       time.Duration
+	proxyFailures       int
+	proxyProbeTimeout   time.Duration
+	proxySavePath       string
+	allowDirectFallback bool
+	collectPath         string
+	proxySources        string
+	collectIterations   int
+	collectUniqueHosts  bool
+	minSlugLength       int
+	maxSlugLength       int
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -44,111 +66,325 @@ func main() {
 	}
 }
 
-func run() (returnErr error) {
-	words := flag.String("words", "", "file with company names or slugs, one per line")
-	brute := flag.Bool("brute", false, "also brute-force slugs (low priority)")
-	bench := flag.Bool("bench", false, "benchmark requests without modifying local.db")
-	providerFlags := make(map[string]*bool)
+func run() error {
+	return newRootCommand().Execute()
+}
+
+func newRootCommand() *cobra.Command {
+	return newRootCommandWithRunner(executeCLI)
+}
+
+func newRootCommandWithRunner(runner func(*cliOptions, string) error) *cobra.Command {
+	opts := &cliOptions{
+		browseAddress:     "127.0.0.1:8080",
+		workers:           64,
+		rps:               50,
+		requestTimeout:    10 * time.Second,
+		cooldown:          2 * time.Minute,
+		proxiesPath:       "off",
+		proxyFailures:     5,
+		proxyProbeTimeout: 3 * time.Second,
+		collectIterations: 2,
+		minSlugLength:     4,
+		maxSlugLength:     5,
+		providerFlags:     make(map[string]*bool),
+	}
+
+	root := &cobra.Command{
+		Use:   "crawler",
+		Short: "Discover and update job-board data",
+		Long: `Crawler finds company boards on supported applicant-tracking platforms,
+indexes their job listings, and provides a local browser for searching and
+bookmarking those listings.
+
+Choose one provider for company discovery. Greenhouse is the default except
+that --words requires an explicit provider. Word-list and brute-force
+discovery can be combined; word-list candidates run first. Requests are
+rate-limited, and rate-limit, access-control, or recognized challenge
+responses stop discovery for that provider. Only query providers and company
+boards you are authorized to access; keep brute-force ranges small.
+
+Proxy lists are manually supplied with --proxies. One eligible route is
+selected and pinned for the run; proxies are not automatically gathered or
+rotated. See README.md for setup, workflows, database configuration, and
+proxy-list examples.`,
+		Example: `  # Discover company boards from a word list
+  crawler --greenhouse --words companies.txt
+
+  # Try a deliberately small slug range and checkpoint progress for later
+  crawler --lever --brute --min 1 --max 1 --resume
+
+  # Refresh jobs for every discovered company
+  crawler --update --jobs
+
+  # Browse and bookmark indexed jobs
+  crawler --browse
+
+  # Use one manually supplied proxy list for this run
+  crawler --greenhouse --words companies.txt --proxies proxies.json`,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			provider, err := validateCLIOptions(opts)
+			if err != nil {
+				return err
+			}
+			return runner(opts, provider)
+		},
+	}
+	flags := root.Flags()
+	flags.StringVar(&opts.words, "words", "", "file with company names or slugs, one per line")
+	flags.BoolVar(&opts.brute, "brute", false, "also brute-force slugs (low priority)")
+	flags.BoolVar(&opts.bench, "bench", false, "benchmark requests without modifying local.db")
 	for _, name := range registeredProviders() {
 		help := "select " + providerDisplayName(name) + " for company discovery"
 		if name == providerGreenhouse {
 			help += " (default)"
 		}
-		providerFlags[name] = flag.Bool(name, false, help)
+		selected := false
+		opts.providerFlags[name] = &selected
+		flags.BoolVar(opts.providerFlags[name], name, false, help)
 	}
-	resume := flag.Bool("resume", false, "resume or checkpoint brute-force progress (requires --brute)")
-	update := flag.Bool("update", false, "update indexed data")
-	updateJobsFlag := flag.Bool("jobs", false, "fetch and refresh jobs for all known companies")
-	browse := flag.Bool("browse", false, "launch the local job browser")
-	browseAddress := flag.String("addr", "127.0.0.1:8080", "job browser listen address")
-	workers := flag.Int("workers", 64, "concurrent workers")
-	rps := flag.Float64("rps", 50, "max requests per second")
-	requestTimeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout (for example 10s or 1m)")
-	cooldown := flag.Duration("cooldown", 2*time.Minute, "pause all requests after rate-limiting responses (HTTP 429, or Greenhouse HTTP 403/406; for example 3m or 32s)")
-	proxiesPath := flag.String("proxies", "off", "proxy list JSON file or http(s) URL (Geonode API supported) for per-peer rotation, or \"off\"")
-	proxyReuseGap := flag.Duration("proxy-reuse-min", 0, "minimum gap before a released proxy is leased again (for example 30s or 5m)")
-	proxyFailures := flag.Int("proxy-failures", 5, "evict a proxy after this many consecutive failures")
-	proxyProbeTimeout := flag.Duration("proxy-probe-timeout", 3*time.Second, "startup health probe timeout per proxy")
-	proxySavePath := flag.String("proxy-save", "", "write surviving proxies with request stats to this JSON file (for example ips.json)")
-	allowDirectFallback := flag.Bool("allow-direct-fallback", false, "allow fallback to direct local IP when all proxies in the pool are evicted (disabled by default to prevent IP leaks)")
-	collectPath := flag.String("collect-proxies", "", "collect and validate proxies from --proxy-sources (or --proxies) and write survivors to this JSON file instead of crawling")
-	proxySources := flag.String("proxy-sources", "", "comma-separated proxy list files or URLs to feed --collect-proxies")
-	collectIterations := flag.Int("collect-iterations", 2, "probe rounds per proxy in --collect-proxies mode; more rounds keep only stable proxies")
-	collectUniqueHosts := flag.Bool("collect-unique-hosts", false, "keep only the best proxy per host in --collect-proxies mode")
-	flag.IntVar(&minSlugLength, "min", minSlugLength, "minimum slug length")
-	flag.IntVar(&maxSlugLength, "max", maxSlugLength, "maximum slug length")
-	flag.Parse()
+	flags.BoolVar(&opts.resume, "resume", false, "resume or checkpoint brute-force progress (requires --brute)")
+	flags.BoolVar(&opts.update, "update", false, "update indexed data")
+	flags.BoolVar(&opts.updateJobs, "jobs", false, "fetch and refresh jobs for all known companies")
+	flags.BoolVar(&opts.browse, "browse", false, "launch the local job browser")
+	flags.StringVar(&opts.browseAddress, "addr", opts.browseAddress, "job browser listen address")
+	flags.IntVar(&opts.workers, "workers", opts.workers, "concurrent workers")
+	flags.Float64Var(&opts.rps, "rps", opts.rps, "max requests per second")
+	flags.DurationVar(&opts.requestTimeout, "timeout", opts.requestTimeout, "HTTP request timeout (for example 10s or 1m)")
+	flags.DurationVar(&opts.cooldown, "cooldown", opts.cooldown, "legacy option; destination rate-limit responses now stop provider work instead of retrying")
+	flags.StringVar(&opts.proxiesPath, "proxies", opts.proxiesPath, "manual proxy list; selects one eligible route and pins it for the run, or \"off\"")
+	flags.DurationVar(&opts.proxyReuseGap, "proxy-reuse-min", 0, "minimum gap before the pinned proxy may handle another request")
+	flags.IntVar(&opts.proxyFailures, "proxy-failures", opts.proxyFailures, "stop using the pinned route after this many consecutive failures")
+	flags.DurationVar(&opts.proxyProbeTimeout, "proxy-probe-timeout", opts.proxyProbeTimeout, "deprecated; proxy health probes are disabled")
+	flags.StringVar(&opts.proxySavePath, "proxy-save", "", "write the selected proxy and its run stats to this JSON file")
+	flags.BoolVar(&opts.allowDirectFallback, "allow-direct-fallback", false, "deprecated; direct fallback is disabled, use --proxies off to select direct mode")
+	flags.StringVar(&opts.collectPath, "collect-proxies", "", "disabled legacy option; proxy collection no longer probes job-board endpoints")
+	flags.StringVar(&opts.proxySources, "proxy-sources", "", "deprecated legacy collection input; collection mode is disabled")
+	flags.IntVar(&opts.collectIterations, "collect-iterations", opts.collectIterations, "deprecated legacy collection option")
+	flags.BoolVar(&opts.collectUniqueHosts, "collect-unique-hosts", false, "deprecated legacy collection option")
+	flags.IntVar(&opts.minSlugLength, "min", opts.minSlugLength, "minimum slug length")
+	flags.IntVar(&opts.maxSlugLength, "max", opts.maxSlugLength, "maximum slug length")
 
-	if minSlugLength < 1 || maxSlugLength < minSlugLength || (*brute && maxSlugLength > 13) {
-		return fmt.Errorf("invalid length range: min=%d max=%d", minSlugLength, maxSlugLength)
+	for name, message := range map[string]string{
+		"cooldown":              "destination restriction responses stop provider work; automatic retries are disabled",
+		"proxy-probe-timeout":   "proxy health probes have been removed",
+		"allow-direct-fallback": "routes remain pinned; select direct mode before a run with --proxies off",
+		"proxy-sources":         "legacy collection mode is disabled",
+		"collect-iterations":    "legacy collection mode is disabled",
+		"collect-unique-hosts":  "legacy collection mode is disabled",
+	} {
+		flags.Lookup(name).Deprecated = message
 	}
-	if *workers < 1 {
-		return errors.New("workers must be at least 1")
+
+	root.SetHelpFunc(writeRootHelp)
+
+	return root
+}
+
+type cliHelpFlagGroup struct {
+	title string
+	names []string
+}
+
+var cliHelpFlagGroups = []cliHelpFlagGroup{
+	{title: "Provider selection", names: []string{"greenhouse", "lever", "levereu", "workable", "ashbyhq"}},
+	{title: "Company discovery", names: []string{"words", "brute", "min", "max", "resume"}},
+	{title: "Request controls", names: []string{"workers", "rps", "timeout"}},
+	{title: "Manual proxy routing", names: []string{"proxies", "proxy-reuse-min", "proxy-failures", "proxy-save"}},
+	{title: "Other modes and browser", names: []string{"bench", "update", "jobs", "browse", "addr"}},
+	{title: "Legacy and disabled options", names: []string{
+		"cooldown", "proxy-probe-timeout", "allow-direct-fallback", "collect-proxies",
+		"proxy-sources", "collect-iterations", "collect-unique-hosts",
+	}},
+	{title: "Help", names: []string{"help"}},
+}
+
+func writeRootHelp(cmd *cobra.Command, _ []string) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "%s\n\n%s\n\nUsage:\n  %s [flags]\n", cmd.Short, strings.TrimSpace(cmd.Long), cmd.CommandPath())
+	for _, group := range cliHelpFlagGroups {
+		writeCLIHelpFlagGroup(out, cmd, group)
 	}
-	if *rps <= 0 {
-		return errors.New("rps must be greater than 0")
+	if example := strings.TrimSpace(cmd.Example); example != "" {
+		fmt.Fprintf(out, "\nExamples:\n%s\n", strings.TrimRight(cmd.Example, "\n"))
 	}
-	if *requestTimeout <= 0 {
-		return errors.New("timeout must be greater than 0")
+}
+
+func writeCLIHelpFlagGroup(out io.Writer, cmd *cobra.Command, group cliHelpFlagGroup) {
+	type helpEntry struct {
+		label       string
+		description string
 	}
-	if *cooldown < 0 {
-		return errors.New("cooldown must not be negative")
+	entries := make([]helpEntry, 0, len(group.names))
+	labelWidth := 0
+	for _, name := range group.names {
+		flag := cmd.Flags().Lookup(name)
+		if flag == nil || flag.Hidden {
+			continue
+		}
+		label := "--" + flag.Name
+		if flag.Shorthand != "" {
+			label = "-" + flag.Shorthand + ", " + label
+		}
+		if flag.Value.Type() != "bool" {
+			label += " " + flag.Value.Type()
+		}
+		description := flag.Usage
+		if flag.Value.Type() != "bool" && flag.DefValue != "" {
+			description += fmt.Sprintf(" (default %q)", flag.DefValue)
+		}
+		if flag.Deprecated != "" {
+			description += " (DEPRECATED: " + flag.Deprecated + ")"
+		}
+		entries = append(entries, helpEntry{label: label, description: description})
+		if len(label) > labelWidth {
+			labelWidth = len(label)
+		}
 	}
-	if *proxiesPath == "" {
-		return errors.New("proxies must be \"off\" or a proxy list file path")
+	if len(entries) == 0 {
+		return
 	}
-	if *proxyFailures < 1 {
-		return errors.New("proxy failures must be at least 1")
+
+	fmt.Fprintf(out, "\n%s:\n", group.title)
+	descriptionWidth := 80 - labelWidth - 4
+	for _, entry := range entries {
+		lines := wrapCLIHelpText(entry.description, descriptionWidth)
+		fmt.Fprintf(out, "  %-*s  %s\n", labelWidth, entry.label, lines[0])
+		for _, line := range lines[1:] {
+			fmt.Fprintf(out, "  %*s  %s\n", labelWidth, "", line)
+		}
 	}
-	if *proxyProbeTimeout <= 0 {
-		return errors.New("proxy probe timeout must be greater than 0")
+}
+
+func wrapCLIHelpText(text string, width int) []string {
+	words := strings.Fields(text)
+	lines := make([]string, 0, 1)
+	var line string
+	for _, word := range words {
+		if line == "" {
+			line = word
+			continue
+		}
+		if len(line)+1+len(word) > width {
+			lines = append(lines, line)
+			line = word
+			continue
+		}
+		line += " " + word
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
+}
+
+func validateCLIOptions(opts *cliOptions) (string, error) {
+	minSlugLength, maxSlugLength := opts.minSlugLength, opts.maxSlugLength
+	if minSlugLength < 1 || maxSlugLength < minSlugLength || (opts.brute && maxSlugLength > 13) {
+		return "", fmt.Errorf("invalid length range: min=%d max=%d", minSlugLength, maxSlugLength)
+	}
+	if opts.workers < 1 {
+		return "", errors.New("workers must be at least 1")
+	}
+	if opts.rps <= 0 {
+		return "", errors.New("rps must be greater than 0")
+	}
+	if opts.requestTimeout <= 0 {
+		return "", errors.New("timeout must be greater than 0")
+	}
+	if opts.cooldown < 0 {
+		return "", errors.New("cooldown must not be negative")
+	}
+	if opts.proxiesPath == "" {
+		return "", errors.New("proxies must be \"off\" or a proxy list file path")
+	}
+	if opts.allowDirectFallback {
+		return "", errors.New("--allow-direct-fallback is disabled; select direct mode before the run with --proxies off")
+	}
+	if opts.proxyFailures < 1 {
+		return "", errors.New("proxy failures must be at least 1")
+	}
+	if opts.proxyProbeTimeout <= 0 {
+		return "", errors.New("proxy probe timeout must be greater than 0")
 	}
 	selectedPortals := 0
 	selectedProvider := ""
-	for name, selected := range providerFlags {
+	for name, selected := range opts.providerFlags {
 		if *selected {
 			selectedPortals++
 			selectedProvider = name
 		}
 	}
 	if selectedPortals > 1 {
-		return errors.New("choose only one provider flag")
+		return "", errors.New("choose only one provider flag")
 	}
 	provider := providerGreenhouse
 	if selectedProvider != "" {
 		provider = selectedProvider
 	}
-	if *words != "" && selectedProvider == "" {
+	if opts.words != "" && selectedProvider == "" {
 		options := make([]string, 0)
 		for _, name := range registeredProviders() {
 			options = append(options, "--"+name)
 		}
-		return fmt.Errorf("--words requires an explicit provider flag: %s", strings.Join(options, ", "))
+		return "", fmt.Errorf("--words requires an explicit provider flag: %s", strings.Join(options, ", "))
 	}
-	if *resume && (!*brute || *bench || *words != "" || *browse || *update) {
-		return errors.New("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
+	if opts.resume && (!opts.brute || opts.bench || opts.words != "" || opts.browse || opts.update) {
+		return "", errors.New("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
 	}
-	if *update != *updateJobsFlag {
-		return errors.New("--update and --jobs must be used together")
+	if opts.update != opts.updateJobs {
+		return "", errors.New("--update and --jobs must be used together")
 	}
-	if *bench && *update {
-		return errors.New("--bench cannot be combined with --update or --jobs")
+	if opts.bench && opts.update {
+		return "", errors.New("--bench cannot be combined with --update or --jobs")
 	}
-	if *browse && (*bench || *update) {
-		return errors.New("--browse cannot be combined with --bench or --update")
+	if opts.browse && (opts.bench || opts.update) {
+		return "", errors.New("--browse cannot be combined with --bench or --update")
 	}
-	if *brute && maxSlugLength >= 6 {
+	if opts.brute && maxSlugLength >= 6 {
 		log.Printf("warning: brute force up to length %d means %d candidates",
 			maxSlugLength, bruteCount(minSlugLength, maxSlugLength))
 	}
-	if *collectPath != "" {
-		if *brute || *words != "" || *bench || *update || *browse || *resume {
-			return errors.New("--collect-proxies cannot be combined with --brute, --words, --bench, --update/--jobs, --browse, or --resume")
+	if opts.collectPath != "" {
+		if opts.brute || opts.words != "" || opts.bench || opts.update || opts.browse || opts.resume {
+			return "", errors.New("--collect-proxies cannot be combined with --brute, --words, --bench, --update/--jobs, --browse, or --resume")
 		}
-		if *collectIterations < 1 {
-			return errors.New("collect iterations must be at least 1")
+		if opts.collectIterations < 1 {
+			return "", errors.New("collect iterations must be at least 1")
 		}
 	}
+	return provider, nil
+}
+
+func executeCLI(opts *cliOptions, provider string) (returnErr error) {
+	if opts.collectPath != "" {
+		return errors.New("legacy --collect-proxies mode is disabled because it probes candidates against job-board endpoints")
+	}
+
+	words := &opts.words
+	brute := &opts.brute
+	bench := &opts.bench
+	resume := &opts.resume
+	update := &opts.update
+	updateJobsFlag := &opts.updateJobs
+	browse := &opts.browse
+	browseAddress := &opts.browseAddress
+	workers := &opts.workers
+	rps := &opts.rps
+	requestTimeout := &opts.requestTimeout
+	cooldown := &opts.cooldown
+	proxiesPath := &opts.proxiesPath
+	proxyReuseGap := &opts.proxyReuseGap
+	proxyFailures := &opts.proxyFailures
+	proxyProbeTimeout := &opts.proxyProbeTimeout
+	proxySavePath := &opts.proxySavePath
+	minSlugLength := &opts.minSlugLength
+	maxSlugLength := &opts.maxSlugLength
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -168,19 +404,6 @@ func run() (returnErr error) {
 			}
 		}
 	}()
-
-	// Collect mode curation runs database-free: fetch the sources,
-	// probe against the provider endpoint, and write the curated file.
-	if *collectPath != "" {
-		if *proxySavePath != "" {
-			log.Printf("--proxy-save has no effect in --collect-proxies mode; the output is --collect-proxies")
-		}
-		sources, sourcesErr := buildProxySources(*proxySources, *proxiesPath)
-		if sourcesErr != nil {
-			return sourcesErr
-		}
-		return collectProxies(ctx, *collectPath, sources, *collectIterations, *collectUniqueHosts, *proxyProbeTimeout, *requestTimeout, providerProbeURL(provider))
-	}
 
 	var (
 		database       *db.DB
@@ -236,17 +459,14 @@ func run() (returnErr error) {
 			log.Printf("--proxy-save has no effect with --browse")
 		}
 	} else if *proxiesPath != "off" {
-		// Validate proxies against the provider this run will actually use:
-		// any HTTP response proves the tunnel works; a bare TCP dial would
-		// admit proxies that open connections but never forward CONNECT.
-		probeURL := providerProbeURL(provider)
+		// Select one manual route without probing job-board endpoints. Its
+		// transport health is learned only from the run's ordinary requests.
 		proxies, err = loadProxyPool(ctx, *proxiesPath, proxyPoolConfig{
-			minReuseGap:         *proxyReuseGap,
-			maxFailures:         *proxyFailures,
-			retryAfterFloor:     time.Second,
-			maxCooldown:         *cooldown,
-			allowDirectFallback: *allowDirectFallback,
-		}, *proxyProbeTimeout, *requestTimeout, probeURL)
+			minReuseGap:     *proxyReuseGap,
+			maxFailures:     *proxyFailures,
+			retryAfterFloor: time.Second,
+			maxCooldown:     *cooldown,
+		}, *proxyProbeTimeout, *requestTimeout, "")
 		if err != nil {
 			return err
 		}
@@ -286,7 +506,7 @@ func run() (returnErr error) {
 
 	seen := make(map[string]struct{})
 	emit := func(slug string) bool {
-		if len(slug) < minSlugLength || len(slug) > maxSlugLength {
+		if len(slug) < *minSlugLength || len(slug) > *maxSlugLength {
 			return true // out of range, skip but keep going
 		}
 		if _, ok := seen[slug]; ok {
@@ -307,19 +527,23 @@ func run() (returnErr error) {
 		}
 	}
 	pool.flush()
+	providerStopErr := pool.providerStop()
 	var runErr error
 	if *words != "" {
 		runErr = saveCheckFailures(pool, "failed.txt")
 	}
-	if *brute && runErr == nil {
-		runErr = runBruteForce(ctx, pool, seen, database, minSlugLength, maxSlugLength, *resume, "failed.txt")
-	}
+	runErr = runBruteUnlessStopped(*brute, runErr, providerStopErr, func() error {
+		return runBruteForce(ctx, pool, seen, database, *minSlugLength, *maxSlugLength, *resume, "failed.txt")
+	})
 
 	pool.close()
 	// Interrupted runs leave checks whose results were only collected by
 	// close(); persist them so failed.txt stays complete.
 	if err := saveCheckFailures(pool, "failed.txt"); err != nil {
 		log.Printf("save check failures: %v", err)
+	}
+	if stopErr := pool.providerStop(); errors.Is(stopErr, errProviderStopped) {
+		runErr = stopErr
 	}
 	if stats != nil {
 		stats.print(time.Since(started))
@@ -328,6 +552,16 @@ func run() (returnErr error) {
 		return runErr
 	}
 	return nil
+}
+
+func runBruteUnlessStopped(brute bool, runErr, providerStopErr error, runBrute func() error) error {
+	if errors.Is(providerStopErr, errProviderStopped) {
+		return providerStopErr
+	}
+	if brute && runErr == nil {
+		return runBrute()
+	}
+	return runErr
 }
 
 // bruteCount returns how many candidates brute force would generate.
@@ -392,20 +626,6 @@ func newClient(workers int, timeout time.Duration) *http.Client {
 			return nil
 		},
 	}
-}
-
-// providerProbeURL picks the endpoint a provider serves any company from;
-// startup validation sends one GET per candidate proxy there, so any HTTP
-// status proves the proxy's tunnel reaches the provider.
-func providerProbeURL(provider string) string {
-	p, err := getProvider(provider)
-	if err != nil {
-		return ""
-	}
-	if endpoints := p.CompanyEndpoints("probe"); len(endpoints) > 0 {
-		return endpoints[0]
-	}
-	return ""
 }
 
 // buildProxySources resolves the candidate sources for --collect-proxies:

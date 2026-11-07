@@ -3,12 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"db"
 	"golang.org/x/time/rate"
@@ -356,43 +356,32 @@ func TestBookmarkButtonTemplateReflectsSavedState(t *testing.T) {
 	}
 }
 
-func TestGreenhouseFetchJobsEntersCooldownOn403And406(t *testing.T) {
+func TestGreenhouseFetchJobsStopsOn403406And429(t *testing.T) {
 	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable, http.StatusTooManyRequests} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			const cooldown = 80 * time.Millisecond
 			requests := 0
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				requests++
-				if requests == 1 {
-					return &http.Response{
-						StatusCode: status,
-						Header:     make(http.Header),
-						Body:       io.NopCloser(strings.NewReader("")),
-						Request:    req,
-					}, nil
-				}
-				body := `{"jobs":[{"id":123,"title":"Go Engineer","company_name":"Example"}],"meta":{"total":1}}`
 				return &http.Response{
-					StatusCode: http.StatusOK,
+					StatusCode: status,
 					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader(body)),
+					Body:       io.NopCloser(strings.NewReader("")),
 					Request:    req,
 				}, nil
 			})}
-			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
-			started := time.Now()
+			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 			jobs, err := (greenhouseProvider{}).FetchJobs(context.Background(), client, nil, limiter, "example")
-			if err != nil {
-				t.Fatal(err)
+			if !errors.Is(err, errProviderStopped) {
+				t.Fatalf("fetch error = %v, want provider stop", err)
 			}
-			if len(jobs) != 1 || jobs[0].ID != 123 {
-				t.Fatalf("unexpected jobs after retry: %+v", jobs)
+			if len(jobs) != 0 {
+				t.Fatalf("unexpected jobs after restriction response: %+v", jobs)
 			}
-			if requests != 2 {
-				t.Fatalf("made %d requests, want 2", requests)
+			if requests != 1 {
+				t.Fatalf("made %d requests, want 1", requests)
 			}
-			if elapsed := time.Since(started); elapsed < cooldown {
-				t.Fatalf("retry completed after %s, before %s cooldown", elapsed, cooldown)
+			if limiter.providerStop(providerGreenhouse) == nil {
+				t.Fatal("provider-wide stop was not recorded")
 			}
 		})
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -402,6 +403,7 @@ func TestCheckPoolCloseReturnsAfterCancel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer database.Close()
 
 	// Every check blocks until the pool context is cancelled, so both
@@ -431,5 +433,43 @@ func TestCheckPoolCloseReturnsAfterCancel(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("pool.close did not finish after cancellation; worker result sends are stuck")
+	}
+}
+
+func TestBruteForceDestinationStopIsNotRetriedOrCheckpointed(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "destination-stop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"30"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 1)
+
+	err = runBruteForce(ctx, pool, make(map[string]struct{}), database, 1, 1, true, filepath.Join(t.TempDir(), "failed.txt"))
+	if !errors.Is(err, errProviderStopped) {
+		t.Fatalf("run error = %v, want provider stop", err)
+	}
+	pool.close()
+
+	if requests != 1 {
+		t.Fatalf("made %d requests after destination stop, want exactly 1", requests)
+	}
+	position, err := database.StartProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 1, alphabet, bruteCount(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 0 {
+		t.Fatalf("checkpoint advanced to %d after a destination stop, want 0", position)
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,11 +32,10 @@ func newTestPool(cfg proxyPoolConfig, peers ...string) *proxyPool {
 
 func freeConfig() proxyPoolConfig {
 	return proxyPoolConfig{
-		minReuseGap:         0,
-		maxFailures:         0,
-		retryAfterFloor:     0,
-		maxCooldown:         0,
-		allowDirectFallback: true,
+		minReuseGap:     0,
+		maxFailures:     0,
+		retryAfterFloor: 0,
+		maxCooldown:     0,
 	}
 }
 
@@ -45,19 +43,12 @@ func testLimiter() *requestLimiter {
 	return newRequestLimiter(golangRate.NewLimiter(golangRate.Inf, 1), 0)
 }
 
-func TestProxyPoolAcquiresExclusiveLeases(t *testing.T) {
+func TestProxyPoolAcquiresExclusiveLeasesOnPinnedRoute(t *testing.T) {
 	pool := newTestPool(freeConfig(), "http://a:80", "http://b:80")
 
 	first, direct, err := pool.acquire(context.Background())
 	if err != nil || direct {
 		t.Fatalf("first acquire: peer=%v direct=%t err=%v", first, direct, err)
-	}
-	second, _, err := pool.acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.raw == second.raw {
-		t.Fatalf("acquired the same proxy twice: %s", first.raw)
 	}
 
 	leased := make(chan *proxyPeer, 1)
@@ -76,7 +67,7 @@ func TestProxyPoolAcquiresExclusiveLeases(t *testing.T) {
 		t.Fatalf("third acquire leased %s while all peers were in use", peer.raw)
 	case <-time.After(50 * time.Millisecond):
 	}
-	// Releasing one peer lets the blocked acquire through.
+	// Releasing the pinned route lets the next request use the same route.
 	pool.release(first, proxyOutcomeOK, 0)
 	select {
 	case peer := <-leased:
@@ -88,7 +79,7 @@ func TestProxyPoolAcquiresExclusiveLeases(t *testing.T) {
 	}
 }
 
-func TestProxyPoolPrefersLeastRecentlyUsed(t *testing.T) {
+func TestProxyPoolDoesNotRotateBetweenPeers(t *testing.T) {
 	pool := newTestPool(freeConfig(), "http://a:80", "http://b:80")
 
 	a, _, _ := pool.acquire(context.Background())
@@ -100,12 +91,12 @@ func TestProxyPoolPrefersLeastRecentlyUsed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.raw != a.raw {
-		t.Fatalf("acquired %s, want least-recently-used %s", c.raw, a.raw)
+	if c.raw != a.raw || b.raw != a.raw {
+		t.Fatalf("routes were %q then %q; want pinned route %q", a.raw, b.raw, a.raw)
 	}
 }
 
-func TestProxyPoolHonorsReuseGap(t *testing.T) {
+func TestProxyPoolHonorsReuseGapWithoutChangingRoute(t *testing.T) {
 	cfg := freeConfig()
 	cfg.minReuseGap = 20 * time.Millisecond
 	pool := newTestPool(cfg, "http://a:80", "http://b:80")
@@ -113,23 +104,24 @@ func TestProxyPoolHonorsReuseGap(t *testing.T) {
 	a, _, _ := pool.acquire(context.Background())
 	pool.release(a, proxyOutcomeOK, 0)
 
+	started := time.Now()
 	next, _, err := pool.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.raw == a.raw {
-		t.Fatalf("reused %s during its reuse gap", a.raw)
+	if next.raw != a.raw {
+		t.Fatalf("acquired %s during pinned route %s reuse gap", next.raw, a.raw)
+	}
+	if time.Since(started) < cfg.minReuseGap {
+		t.Fatalf("reused pinned route after %s, before %s reuse gap", time.Since(started), cfg.minReuseGap)
 	}
 	pool.release(next, proxyOutcomeOK, 0)
-	time.Sleep(cfg.minReuseGap + 10*time.Millisecond)
-
 	again, _, err := pool.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// a became eligible first; b is still gap blocked.
 	if again.raw != a.raw {
-		t.Fatalf("acquired %s after the gap, want %s", again.raw, a.raw)
+		t.Fatalf("acquired %s after the gap, want pinned route %s", again.raw, a.raw)
 	}
 }
 
@@ -159,18 +151,18 @@ func TestProxyPool429CooldownFloorsAndCapsRetryAfter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next.raw == a.raw {
-		t.Fatalf("reused %s while its cooldown was active", a.raw)
+	if next.raw != a.raw {
+		t.Fatalf("acquired %s while pinned route %s was cooling down", next.raw, a.raw)
 	}
+	pool.release(next, proxyOutcomeOK, 0)
 
-	// After the capped cooldown expires the peer becomes eligible again.
-	time.Sleep(cfg.maxCooldown + 50*time.Millisecond)
+	// The same pinned route remains in use after its cooldown expires.
 	again, _, err := pool.acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if again.raw != a.raw {
-		t.Fatalf("acquired %s after the capped cooldown expired, want %s", again.raw, a.raw)
+		t.Fatalf("acquired %s after the capped cooldown expired, want pinned route %s", again.raw, a.raw)
 	}
 }
 
@@ -197,11 +189,8 @@ func TestProxyPoolEvictsAfterConsecutiveFailures(t *testing.T) {
 		t.Fatalf("healthy peers = %d after eviction, want 0", pool.healthyPeers())
 	}
 	_, direct, err := pool.acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !direct {
-		t.Fatal("drained pool did not request the direct fallback")
+	if err == nil || direct {
+		t.Fatalf("evicted pinned route changed egress: direct=%t err=%v", direct, err)
 	}
 }
 
@@ -223,26 +212,12 @@ func TestProxyPoolSuccessResetsFailureCount(t *testing.T) {
 	}
 }
 
-func TestProxyPoolDirectFallbackWithNoHealthyPeers(t *testing.T) {
+func TestProxyPoolNeverFallsBackToDirectWithNoHealthyPeers(t *testing.T) {
 	pool := newTestPool(freeConfig())
 
 	_, direct, err := pool.acquire(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !direct {
-		t.Fatal("empty pool did not request the direct fallback")
-	}
-}
-
-func TestProxyPoolFailClosedWhenDirectFallbackDisallowed(t *testing.T) {
-	cfg := freeConfig()
-	cfg.allowDirectFallback = false
-	pool := newTestPool(cfg)
-
-	_, _, err := pool.acquire(context.Background())
-	if err == nil {
-		t.Fatal("expected fail-closed error when allowDirectFallback is false, got nil")
+	if err == nil || direct {
+		t.Fatalf("empty pool changed egress: direct=%t err=%v", direct, err)
 	}
 }
 
@@ -293,8 +268,10 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-func TestLoadProxyPoolFiltersAndKeepsUptimeOrder(t *testing.T) {
+func TestLoadProxyPoolPinsOneEligibleRouteWithoutTargetProbe(t *testing.T) {
+	var targetRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -314,18 +291,21 @@ func TestLoadProxyPoolFiltersAndKeepsUptimeOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pool, err := loadProxyPool(context.Background(), path, freeConfig(), time.Second, 5*time.Second, "")
+	pool, err := loadProxyPool(context.Background(), path, freeConfig(), time.Second, 5*time.Second, server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pool.healthyPeers() != 2 {
-		t.Fatalf("healthy peers = %d, want 2 (duplicate and invalid entries removed)", pool.healthyPeers())
+	if pool.healthyPeers() != 1 || len(pool.peers) != 1 {
+		t.Fatalf("healthy peers = %d, len(peers) = %d; want one pinned route", pool.healthyPeers(), len(pool.peers))
 	}
-	if pool.peers[0].raw != socksURL {
-		t.Fatalf("first peer = %s, want the highest uptime survivor %s", pool.peers[0].raw, socksURL)
+	if pool.peers[0].raw != "http://127.0.0.1:1937" {
+		t.Fatalf("pinned route = %s, want highest-uptime eligible proxy", pool.peers[0].raw)
 	}
-	if pool.peers[1].raw != server.URL {
-		t.Fatalf("second peer = %s, want the remaining survivor %s", pool.peers[1].raw, server.URL)
+	if pool.pinned != pool.peers[0] {
+		t.Fatal("selected route was not pinned in the pool")
+	}
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("startup sent %d target probe(s), want none", got)
 	}
 }
 
@@ -349,9 +329,8 @@ func TestReleaseTracksPeerStats(t *testing.T) {
 		t.Fatal("last_used missing from snapshot")
 	}
 
-	// Consecutive failures still reset on a success: two failures after
-	// one success evict, while failure,failure,success continues.
-	evictor := newTestPool(proxyPoolConfig{maxFailures: 2, allowDirectFallback: true}, "http://x:80")
+	// Consecutive failures still reset on a success.
+	evictor := newTestPool(proxyPoolConfig{maxFailures: 2}, "http://x:80")
 	target := evictor.peers[0]
 	evictor.release(target, proxyOutcomeOK, 0)
 	evictor.release(target, proxyOutcomeFailed, 0)
@@ -362,8 +341,8 @@ func TestReleaseTracksPeerStats(t *testing.T) {
 	if evictor.healthyPeers() != 0 {
 		t.Fatalf("healthy=%d after two consecutive failures, want 0", evictor.healthyPeers())
 	}
-	if _, direct, err := evictor.acquire(context.Background()); err != nil || !direct {
-		t.Fatalf("expected direct fallback after eviction, direct=%t err=%v", direct, err)
+	if _, direct, err := evictor.acquire(context.Background()); err == nil || direct {
+		t.Fatalf("expected pinned route failure after eviction, direct=%t err=%v", direct, err)
 	}
 
 	if note := pool.progressNote(); note != ", 1/1 proxy peers healthy" {
@@ -469,7 +448,9 @@ func TestDecodeGeonodeListMapsRecords(t *testing.T) {
 }
 
 func TestLoadProxyPoolFetchesURLSource(t *testing.T) {
+	var targetRequests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer target.Close()
@@ -495,16 +476,16 @@ func TestLoadProxyPoolFetchesURLSource(t *testing.T) {
 	if atomic.LoadInt32(&requests) != 1 {
 		t.Fatalf("list fetches = %d, want 1", requests)
 	}
-	// The transparent record is dropped by the elite filter and the same
-	// host serves two peers (one per advertised protocol).
-	if peerPool.healthyPeers() != 2 {
-		t.Fatalf("healthy peers = %d, want 2", peerPool.healthyPeers())
+	// The transparent record is filtered; the highest-ranked eligible
+	// route is pinned without contacting its host.
+	if peerPool.healthyPeers() != 1 {
+		t.Fatalf("healthy peers = %d, want 1", peerPool.healthyPeers())
 	}
 	if peerPool.peers[0].raw != "socks5://"+serverHost {
 		t.Fatalf("first peer = %s, want socks5://%s", peerPool.peers[0].raw, serverHost)
 	}
-	if peerPool.peers[1].raw != "http://"+serverHost {
-		t.Fatalf("second peer = %s, want http://%s", peerPool.peers[1].raw, serverHost)
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("loaded route triggered %d target probe(s), want none", got)
 	}
 }
 
@@ -561,73 +542,42 @@ func TestDecodeProxyListAcceptsBareArrayAndWrappedObject(t *testing.T) {
 	}
 }
 
-func TestLoadProxyPoolFailsWithoutAliveProxy(t *testing.T) {
+func TestLoadProxyPoolDoesNotRequireHealthProbe(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.json")
 	content := `{"proxy":"http://127.0.0.1:1937","protocol":"http","alive":true,"anonymity":"elite","uptime":9}`
 	if err := os.WriteFile(path, []byte("["+content+"]"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadProxyPool(context.Background(), path, freeConfig(), 300*time.Millisecond, 5*time.Second, ""); err == nil {
-		t.Fatal("expected an error when no proxy passes the health probe")
+	pool, err := loadProxyPool(context.Background(), path, freeConfig(), 300*time.Millisecond, 5*time.Second, "https://boards.example/probe")
+	if err != nil {
+		t.Fatalf("manual route was rejected without a health probe: %v", err)
+	}
+	if len(pool.peers) != 1 || pool.peers[0].raw != "http://127.0.0.1:1937" {
+		t.Fatalf("unexpected pinned route: %+v", pool.peers)
 	}
 }
 
-func probeResponse() *http.Response {
-	return &http.Response{
-		StatusCode: http.StatusNotFound,
-		Status:     "404 Not Found",
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader("")),
-	}
-}
-
-func TestCurateProxiesKeepsAnsweringCandidates(t *testing.T) {
-	good := &collectCandidate{
-		entry:  proxyListEntry{Proxy: "http://good:80", Protocol: "http", Alive: true, Anonymity: "elite"},
-		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return probeResponse(), nil })},
-	}
-	calls := 0
-	flaky := &collectCandidate{
-		entry: proxyListEntry{Proxy: "http://flaky:80", Protocol: "http", Alive: true, Anonymity: "elite"},
-		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			calls++
-			if calls == 1 {
-				return nil, errors.New("connection reset")
-			}
-			return probeResponse(), nil
-		})},
-	}
-	dead := &collectCandidate{
-		entry:  proxyListEntry{Proxy: "http://dead:80", Protocol: "http", Alive: true, Anonymity: "elite"},
-		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("tunnel refused") })},
+func TestCurateProxiesDoesNotProbeCandidates(t *testing.T) {
+	candidates := []*collectCandidate{
+		{entry: proxyListEntry{Proxy: "http://b:80", Protocol: "http", Alive: true, Anonymity: "elite"}},
+		{entry: proxyListEntry{Proxy: "http://a:80", Protocol: "http", Alive: true, Anonymity: "elite"}},
+		{entry: proxyListEntry{Proxy: "http://dead:80", Protocol: "http", Alive: true, Anonymity: "elite"}},
 	}
 
-	saved, err := curateProxies(context.Background(), []*collectCandidate{good, flaky, dead}, 2, time.Second, "https://boards.example/probe")
+	saved, err := curateProxies(context.Background(), candidates)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(saved) != 2 {
-		t.Fatalf("curated %d entries, want 2", len(saved))
+	if len(saved) != 3 {
+		t.Fatalf("curated %d entries, want all 3 eligible source entries", len(saved))
 	}
-	if saved[0].Proxy != "http://good:80" || saved[0].Successes != 2 || saved[0].Requests != 2 || saved[0].Failures != 0 {
-		t.Fatalf("first entry: %+v", saved[0])
+	if saved[0].Proxy != "http://a:80" || saved[1].Proxy != "http://b:80" || saved[2].Proxy != "http://dead:80" {
+		t.Fatalf("candidates not sorted deterministically: %+v", saved)
 	}
-	if saved[1].Proxy != "http://flaky:80" || saved[1].Successes != 1 || saved[1].Failures != 1 || saved[1].Requests != 2 {
-		t.Fatalf("second entry: %+v", saved[1])
-	}
-	if saved[0].ResponseMs < 0 {
-		t.Fatalf("response_ms must not be negative: %+v", saved[0])
-	}
-	if saved[0].LastUsed == "" {
-		t.Fatal("last_used missing")
-	}
-
-	none := []*collectCandidate{{
-		entry:  proxyListEntry{Proxy: "http://dead:80", Protocol: "http", Alive: true},
-		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("dead") })},
-	}}
-	if _, err := curateProxies(context.Background(), none, 2, time.Second, "https://boards.example/probe"); err == nil {
-		t.Fatal("expected an error when no candidate ever answers")
+	for _, entry := range saved {
+		if entry.Requests != 0 || entry.Successes != 0 || entry.Failures != 0 {
+			t.Fatalf("unverified candidate includes fabricated transport stats: %+v", entry)
+		}
 	}
 }
 
@@ -664,7 +614,9 @@ func TestEligibleProxyEntriesFiltersAndCollapsesHosts(t *testing.T) {
 }
 
 func TestCollectProxiesWritesCuratedFile(t *testing.T) {
+	var targetRequests atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer target.Close()
@@ -693,50 +645,29 @@ func TestCollectProxiesWritesCuratedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("curated file is not loadable: %v", err)
 	}
-	if len(decoded) != 2 {
-		t.Fatalf("curated %d entries, want 2 (unreachable candidate dropped)", len(decoded))
+	if len(decoded) != 3 {
+		t.Fatalf("curated %d entries, want all 3 eligible source candidates", len(decoded))
 	}
 	var saved []proxySaveEntry
 	if err := json.Unmarshal(data, &saved); err != nil {
 		t.Fatal(err)
 	}
-	// Equal successes hand ordering to the latency tie-break, which is
-	// intentionally nondeterministic; accept either order.
-	if !((saved[0].Proxy == "http://"+targetHost && saved[1].Proxy == "socks5://"+targetHost) ||
-		(saved[0].Proxy == "socks5://"+targetHost && saved[1].Proxy == "http://"+targetHost)) {
-		t.Fatalf("saved proxies: %s and %s, want the two target entries", saved[0].Proxy, saved[1].Proxy)
+	if saved[0].Proxy != "http://127.0.0.1:1" ||
+		saved[1].Proxy != "http://"+targetHost ||
+		saved[2].Proxy != "socks5://"+targetHost {
+		t.Fatalf("saved candidates not sorted deterministically: %+v", saved)
 	}
 	for _, entry := range saved {
-		if entry.Successes != 2 {
-			t.Fatalf("probe rounds not counted: %+v", entry)
+		if entry.Successes != 0 || entry.Requests != 0 || entry.Failures != 0 {
+			t.Fatalf("unverified candidate has transport stats: %+v", entry)
 		}
 	}
-}
-
-func TestProbePeerTunnelCheckDropsDeadTunnels(t *testing.T) {
-	alivePeer := &proxyPeer{raw: "http://alive:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusNotFound,
-			Status:     "404 Not Found",
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("")),
-			Request:    req,
-		}, nil
-	})}}
-	deadTunnelPeer := &proxyPeer{raw: "http://dead:80", client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("proxy: CONNECT tunnel to target refused")
-	})}}
-
-	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
-	if !probePeer(context.Background(), dialer, alivePeer, time.Second, "https://boards.example/boards/probe") {
-		t.Fatal("tunnel-capable peer was dropped")
-	}
-	if probePeer(context.Background(), dialer, deadTunnelPeer, time.Second, "https://boards.example/boards/probe") {
-		t.Fatal("transport-error proxy passed the tunnel probe")
+	if got := targetRequests.Load(); got != 0 {
+		t.Fatalf("collection sent %d target probe(s), want none", got)
 	}
 }
 
-func TestFetchProviderResponseRotatesProxyOn429(t *testing.T) {
+func TestFetchProviderResponseStopsOn429WithoutRetryOrRotation(t *testing.T) {
 	var mu sync.Mutex
 	hits := map[string]int{}
 
@@ -771,28 +702,116 @@ func TestFetchProviderResponseRotatesProxyOn429(t *testing.T) {
 	}
 	provider := rotationTestProvider{endpoints: []string{"https://boards.example/boards/example"}}
 
+	limiter := testLimiter()
 	response, err := fetchProviderResponse(
-		context.Background(), &http.Client{}, pool, testLimiter(), provider, "example", nil)
-	if err != nil {
-		t.Fatal(err)
+		context.Background(), &http.Client{}, pool, limiter, provider, "example", nil)
+	if !errors.Is(err, errProviderStopped) {
+		t.Fatalf("fetch error = %v, want provider stop", err)
 	}
-	if !response.ok {
-		t.Fatal("rotation did not end with a successful response")
+	var stop *providerStopError
+	if !errors.As(err, &stop) || stop.retryAfter < 59*time.Second {
+		t.Fatalf("provider stop = %#v, want parsed Retry-After", stop)
+	}
+	if response.ok {
+		t.Fatal("429 unexpectedly returned a successful response")
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if hits["limited"] != 1 || hits["healthy"] != 1 {
-		t.Fatalf("hit counts = %v, want exactly one request per proxy", hits)
+	if hits["limited"] != 1 || hits["healthy"] != 0 {
+		t.Fatalf("hit counts = %v, want one request on the pinned proxy and no alternate", hits)
 	}
 	if limitedPeer.failures != 1 {
 		t.Fatalf("rate limited peer failures = %d, want 1", limitedPeer.failures)
 	}
-	if time.Until(limitedPeer.cooldownUntil) <= 0 {
-		t.Fatal("Retry-After did not set a cooldown on the rate limited peer")
+	if limiter.providerStop(provider.Name()) == nil {
+		t.Fatal("provider-wide stop was not recorded")
 	}
-	if !healthyPeer.cooldownUntil.IsZero() {
-		t.Fatal("healthy peer received an unexpected cooldown")
+	if time.Until(limitedPeer.cooldownUntil) <= 0 {
+		t.Fatal("Retry-After did not set a cooldown on the stopped route")
+	}
+}
+
+func TestFetchProviderRetriesServerErrorOnSamePinnedRoute(t *testing.T) {
+	firstRequests := 0
+	alternateRequests := 0
+	first := &proxyPeer{raw: "http://first:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		firstRequests++
+		if firstRequests == 1 {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}}
+	alternate := &proxyPeer{raw: "http://alternate:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		alternateRequests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}}
+	pool := &proxyPool{peers: []*proxyPeer{first, alternate}, healthy: 2, cfg: freeConfig()}
+	provider := rotationTestProvider{endpoints: []string{"https://boards.example/boards/example"}}
+
+	response, err := fetchProviderResponse(context.Background(), &http.Client{}, pool, testLimiter(), provider, "example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.ok {
+		t.Fatal("expected pinned-route retry to succeed")
+	}
+	if firstRequests != 2 || alternateRequests != 0 {
+		t.Fatalf("first proxy requests=%d alternate proxy requests=%d, want 2 and 0", firstRequests, alternateRequests)
+	}
+}
+
+func TestFetchProviderRetriesTransportFailureOnSamePinnedRoute(t *testing.T) {
+	firstRequests := 0
+	alternateRequests := 0
+	first := &proxyPeer{raw: "http://first:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		firstRequests++
+		if firstRequests == 1 {
+			return nil, errors.New("connection reset")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}}
+	alternate := &proxyPeer{raw: "http://alternate:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		alternateRequests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			Request:    req,
+		}, nil
+	})}}
+	pool := &proxyPool{peers: []*proxyPeer{first, alternate}, healthy: 2, cfg: freeConfig()}
+	provider := rotationTestProvider{endpoints: []string{"https://boards.example/boards/example"}}
+
+	response, err := fetchProviderResponse(context.Background(), &http.Client{}, pool, testLimiter(), provider, "example", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.ok {
+		t.Fatal("expected pinned-route retry to succeed")
+	}
+	if firstRequests != 2 || alternateRequests != 0 {
+		t.Fatalf("first proxy requests=%d alternate proxy requests=%d, want 2 and 0", firstRequests, alternateRequests)
 	}
 }
 
@@ -829,15 +848,12 @@ func (p rotationTestProvider) FetchJobs(
 	return []db.Job{}, nil
 }
 
-func TestGreenhouseRotatesPeerOn403And406(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseStopsProviderOnDestinationRestrictions(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusNotAcceptable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			var mu sync.Mutex
-			hits := map[string]int{}
+			var restrictedHits, alternateHits int
 			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				mu.Lock()
-				hits["limited"]++
-				mu.Unlock()
+				restrictedHits++
 				return &http.Response{
 					StatusCode: status,
 					Header:     http.Header{"Retry-After": []string{"2"}},
@@ -846,9 +862,7 @@ func TestGreenhouseRotatesPeerOn403And406(t *testing.T) {
 				}, nil
 			})}}
 			healthyPeer := &proxyPeer{raw: "http://healthy:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				mu.Lock()
-				hits["healthy"]++
-				mu.Unlock()
+				alternateHits++
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Body:       io.NopCloser(strings.NewReader("")),
@@ -860,38 +874,27 @@ func TestGreenhouseRotatesPeerOn403And406(t *testing.T) {
 				healthy: 2,
 				cfg:     freeConfig(),
 			}
-			found, err := (greenhouseProvider{}).CheckCompany(
-				context.Background(), &http.Client{}, pool, testLimiter(), "example", nil)
-			if err != nil {
-				t.Fatal(err)
+			limiter := testLimiter()
+			found, err := (greenhouseProvider{}).CheckCompany(context.Background(), &http.Client{}, pool, limiter, "example", nil)
+			if !errors.Is(err, errProviderStopped) || found {
+				t.Fatalf("found=%t err=%v; want a provider stop", found, err)
 			}
-			if !found {
-				t.Fatal("expected company to be found after rotation")
+			if restrictedHits != 1 || alternateHits != 0 {
+				t.Fatalf("restricted requests=%d alternate requests=%d, want 1 and 0", restrictedHits, alternateHits)
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			if hits["limited"] != 1 || hits["healthy"] != 1 {
-				t.Fatalf("hit counts = %v, want 1 limited and 1 healthy", hits)
-			}
-			if limitedPeer.failures != 1 {
-				t.Fatalf("rate limited peer failures = %d, want 1", limitedPeer.failures)
-			}
-			if time.Until(limitedPeer.cooldownUntil) <= 0 {
-				t.Fatal("Retry-After did not set cooldown on limited peer")
+			if limiter.providerStop(providerGreenhouse) == nil {
+				t.Fatal("provider stop was not recorded")
 			}
 		})
 	}
 }
 
-func TestGreenhouseFetchJobsRotatesPeerOn403And406(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseFetchJobsStopsOnDestinationRestrictions(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusNotAcceptable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
-			var mu sync.Mutex
-			hits := map[string]int{}
+			var restrictedHits, alternateHits int
 			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				mu.Lock()
-				hits["limited"]++
-				mu.Unlock()
+				restrictedHits++
 				return &http.Response{
 					StatusCode: status,
 					Header:     http.Header{"Retry-After": []string{"2"}},
@@ -900,9 +903,7 @@ func TestGreenhouseFetchJobsRotatesPeerOn403And406(t *testing.T) {
 				}, nil
 			})}}
 			healthyPeer := &proxyPeer{raw: "http://healthy:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				mu.Lock()
-				hits["healthy"]++
-				mu.Unlock()
+				alternateHits++
 				body := `{"jobs":[{"id":456,"title":"Backend Dev"}],"meta":{"total":1}}`
 				return &http.Response{
 					StatusCode: http.StatusOK,
@@ -915,24 +916,16 @@ func TestGreenhouseFetchJobsRotatesPeerOn403And406(t *testing.T) {
 				healthy: 2,
 				cfg:     freeConfig(),
 			}
-			jobs, err := (greenhouseProvider{}).FetchJobs(
-				context.Background(), &http.Client{}, pool, testLimiter(), "example")
-			if err != nil {
-				t.Fatal(err)
+			limiter := testLimiter()
+			jobs, err := (greenhouseProvider{}).FetchJobs(context.Background(), &http.Client{}, pool, limiter, "example")
+			if !errors.Is(err, errProviderStopped) || len(jobs) != 0 {
+				t.Fatalf("jobs=%+v err=%v; want a provider stop", jobs, err)
 			}
-			if len(jobs) != 1 || jobs[0].ID != 456 {
-				t.Fatalf("unexpected jobs after rotation: %+v", jobs)
+			if restrictedHits != 1 || alternateHits != 0 {
+				t.Fatalf("restricted requests=%d alternate requests=%d, want 1 and 0", restrictedHits, alternateHits)
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			if hits["limited"] != 1 || hits["healthy"] != 1 {
-				t.Fatalf("hit counts = %v, want 1 limited and 1 healthy", hits)
-			}
-			if limitedPeer.failures != 1 {
-				t.Fatalf("rate limited peer failures = %d, want 1", limitedPeer.failures)
-			}
-			if time.Until(limitedPeer.cooldownUntil) <= 0 {
-				t.Fatal("Retry-After did not set cooldown on limited peer")
+			if limiter.providerStop(providerGreenhouse) == nil {
+				t.Fatal("provider stop was not recorded")
 			}
 		})
 	}
