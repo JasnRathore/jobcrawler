@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"sync"
@@ -199,13 +200,27 @@ func runBruteForce(
 		next = batchEnd
 		processed += batchEnd - batchStart
 		if resume {
-			saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := database.SaveProviderBruteCheckpoint(saveCtx, pool.provider, minLength, maxLength, alphabet, next, total)
-			cancel()
-			if err != nil {
-				return err
+			const maxRetries = 3
+			backoff := time.Second
+			var saveErr error
+			for attempt := 0; attempt <= maxRetries; attempt++ {
+				saveCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				saveErr = database.SaveProviderBruteCheckpoint(saveCtx, pool.provider, minLength, maxLength, alphabet, next, total)
+				cancel()
+				if saveErr == nil {
+					lastSaved = next
+					break
+				}
+				if attempt == maxRetries {
+					log.Printf("Warning: could not save brute-force checkpoint for %s at candidate %d of %d after %d attempts; continuing: %v",
+						pool.provider, next, total, maxRetries+1, saveErr)
+					break
+				}
+
+				jitter := time.Duration(rand.Int63n(int64(backoff/5*2)+1)) - backoff/5
+				time.Sleep(backoff + jitter)
+				backoff *= 2
 			}
-			lastSaved = next
 		}
 
 		now := time.Now()
