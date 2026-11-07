@@ -351,7 +351,7 @@ func TestReleaseTracksPeerStats(t *testing.T) {
 
 	// Consecutive failures still reset on a success: two failures after
 	// one success evict, while failure,failure,success continues.
-	evictor := newTestPool(proxyPoolConfig{maxFailures: 2}, "http://x:80")
+	evictor := newTestPool(proxyPoolConfig{maxFailures: 2, allowDirectFallback: true}, "http://x:80")
 	target := evictor.peers[0]
 	evictor.release(target, proxyOutcomeOK, 0)
 	evictor.release(target, proxyOutcomeFailed, 0)

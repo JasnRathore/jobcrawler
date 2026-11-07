@@ -356,7 +356,19 @@ func newClient(workers int, timeout time.Duration) *http.Client {
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 3 * time.Second,
 	}
-	return &http.Client{Transport: tr, Timeout: timeout}
+	return &http.Client{
+		Transport: tr,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
 }
 
 // providerProbeURL picks the endpoint a provider serves any company from;

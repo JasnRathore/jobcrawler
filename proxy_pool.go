@@ -433,7 +433,19 @@ func newPeerClient(proxyURL *url.URL, timeout time.Duration) *http.Client {
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 3 * time.Second,
 	}
-	return &http.Client{Transport: tr, Timeout: timeout}
+	return &http.Client{
+		Transport: tr,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if len(via) > 0 && req.URL.Host != via[0].URL.Host {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
 }
 
 // acquire leases a peer exclusively. It blocks until a peer is eligible
@@ -527,7 +539,7 @@ func (p *proxyPool) release(peer *proxyPeer, outcome proxyOutcome, retryAfter ti
 		peer.failures = 0
 		peer.successes++
 	case proxyOutcomeRateLimited:
-		// Upstream edge throttle is not a peer transport death; cool down without counting toward eviction.
+		peer.failures++
 		peer.failuresTotal++
 		wait := retryAfter
 		if wait < p.cfg.retryAfterFloor {
@@ -545,7 +557,7 @@ func (p *proxyPool) release(peer *proxyPeer, outcome proxyOutcome, retryAfter ti
 		peer.failures++
 		peer.failuresTotal++
 	}
-	if !peer.evicted && p.cfg.maxFailures > 0 && peer.failures >= p.cfg.maxFailures {
+	if outcome != proxyOutcomeRateLimited && !peer.evicted && p.cfg.maxFailures > 0 && peer.failures >= p.cfg.maxFailures {
 		peer.evicted = true
 		p.healthy--
 		log.Printf("proxy %s evicted after %d consecutive failures (%d healthy left)",

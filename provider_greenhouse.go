@@ -58,7 +58,7 @@ func (greenhouseProvider) CheckCompany(
 			lease.release(proxyOutcomeFailed, 0)
 			return false, err
 		}
-		req.Header.Set("Accept", "application/json")
+		setStandardHeaders(req)
 		started := time.Now()
 		res, requestErr := lease.client.Do(req)
 		if res != nil && res.Body != nil {

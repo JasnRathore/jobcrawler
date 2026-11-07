@@ -231,7 +231,7 @@ func fetchGreenhouseJobs(
 			lease.release(proxyOutcomeFailed, 0)
 			return nil, fmt.Errorf("create jobs request: %w", err)
 		}
-		req.Header.Set("Accept", "application/json")
+		setStandardHeaders(req)
 		res, err := lease.client.Do(req)
 		if err != nil {
 			if res != nil && res.Body != nil {

@@ -69,31 +69,60 @@ func newCheckPool(ctx context.Context, client *http.Client, proxies *proxyPool, 
 	return pool
 }
 
-// submit queues a check and drains periodically so producers cannot outrun result collection.
+// submit queues a check using a continuous sliding window so workers never starve at batch barriers.
 func (p *checkPool) submit(slug string) (int, bool) {
+	// Opportunistically drain any finished results to keep the pipeline moving
+	for {
+		select {
+		case result := <-p.results:
+			p.pending--
+			if result.err != nil {
+				log.Printf("%s: %v", result.slug, result.err)
+				p.failures = append(p.failures, result)
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+	// If the in-flight window is full, wait for at least one result
+	for p.pending >= checkQueueSize {
+		select {
+		case result := <-p.results:
+			p.pending--
+			if result.err != nil {
+				log.Printf("%s: %v", result.slug, result.err)
+				p.failures = append(p.failures, result)
+			}
+		case <-p.ctx.Done():
+			return 0, false
+		}
+	}
+
 	select {
 	case p.jobs <- slug:
 		p.pending++
+		return 0, true
 	case <-p.ctx.Done():
 		return 0, false
 	}
-	if p.pending >= checkQueueSize {
-		return p.flush(), true
-	}
-	return 0, true
 }
 
 func (p *checkPool) flush() int {
 	failures := 0
-	for i := 0; i < p.pending; i++ {
-		result := <-p.results
-		if result.err != nil {
-			failures++
-			log.Printf("%s: %v", result.slug, result.err)
-			p.failures = append(p.failures, result)
+	for p.pending > 0 {
+		select {
+		case result := <-p.results:
+			p.pending--
+			if result.err != nil {
+				failures++
+				log.Printf("%s: %v", result.slug, result.err)
+				p.failures = append(p.failures, result)
+			}
+		case <-p.ctx.Done():
+			return failures
 		}
 	}
-	p.pending = 0
 	return failures
 }
 

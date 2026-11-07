@@ -21,7 +21,15 @@ const (
 	providerLever      = "lever"
 	providerLeverEU    = "levereu"
 	providerWorkable   = "workable"
+
+	defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+
+func setStandardHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", defaultUserAgent)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+}
 
 type requestLimiter struct {
 	*rate.Limiter
@@ -44,6 +52,9 @@ func (l *requestLimiter) Wait(ctx context.Context) error {
 	for {
 		l.mu.Lock()
 		wait := time.Until(l.cooldownUntil)
+		if wait <= 0 && l.Limiter.Burst() != l.maxBurst {
+			l.Limiter.SetBurst(l.maxBurst)
+		}
 		l.mu.Unlock()
 		if wait > 0 {
 			timer := time.NewTimer(wait)
@@ -244,7 +255,7 @@ func fetchProviderResponse(
 				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, fmt.Errorf("create %s request: %w", name, err)
 			}
-			req.Header.Set("Accept", "application/json")
+			setStandardHeaders(req)
 			started := time.Now()
 			res, requestErr := lease.client.Do(req)
 			status := 0
