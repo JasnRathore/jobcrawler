@@ -94,7 +94,7 @@ func TestProxyRefreshCommandHelpDocumentsBuiltInSourcesAndNoRouting(t *testing.T
 	}
 	for _, expected := range []string{
 		"HProxy", "Proxifly", "ProxyScrape", "Geonode", "--source", "--limit",
-		"stdout", "not probed", "Destination rate limits",
+		"stdout", "not probed", "rate limit cools",
 		// Storage and reuse guidance.
 		"Storage and reuse", "--proxies FILE", "--proxy-save", "Examples:",
 	} {

@@ -773,7 +773,7 @@ func TestCollectProxiesWritesCuratedFile(t *testing.T) {
 	}
 }
 
-func TestFetchProviderResponseStopsOn429WithoutRetryOrRotation(t *testing.T) {
+func TestFetchProviderResponseRotatesOn429WithoutStopping(t *testing.T) {
 	var mu sync.Mutex
 	hits := map[string]int{}
 
@@ -811,30 +811,29 @@ func TestFetchProviderResponseStopsOn429WithoutRetryOrRotation(t *testing.T) {
 	limiter := testLimiter()
 	response, err := fetchProviderResponse(
 		context.Background(), &http.Client{}, pool, limiter, provider, "example", nil)
-	if !errors.Is(err, errProviderStopped) {
-		t.Fatalf("fetch error = %v, want provider stop", err)
+	if err != nil {
+		t.Fatalf("fetch error = %v, want rotation onto the healthy route", err)
 	}
-	var stop *providerStopError
-	if !errors.As(err, &stop) || stop.retryAfter < 59*time.Second {
-		t.Fatalf("provider stop = %#v, want parsed Retry-After", stop)
-	}
-	if response.ok {
-		t.Fatal("429 unexpectedly returned a successful response")
+	if !response.ok || len(response.body) == 0 {
+		t.Fatalf("response = %+v, want the healthy route's body", response)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if hits["limited"] != 1 || hits["healthy"] != 0 {
-		t.Fatalf("hit counts = %v, want one request on the cooling proxy and no alternate", hits)
+	if hits["limited"] != 1 || hits["healthy"] != 1 {
+		t.Fatalf("hit counts = %v, want one request per route: the 429 cools its route and the retry uses another", hits)
 	}
 	if limitedPeer.failures != 1 {
 		t.Fatalf("rate limited peer failures = %d, want 1", limitedPeer.failures)
 	}
-	if limiter.providerStop(provider.Name()) == nil {
-		t.Fatal("provider-wide stop was not recorded")
+	if limiter.providerStop(provider.Name()) != nil {
+		t.Fatal("provider-wide stop was recorded for a 429; rate limits should rotate, not stop")
+	}
+	if !limiter.cooldownUntil.IsZero() {
+		t.Fatal("a single 429 tripped the global pause, want route rotation instead")
 	}
 	if time.Until(limitedPeer.cooldownUntil) <= 0 {
-		t.Fatal("Retry-After did not set a cooldown on the stopped route")
+		t.Fatal("Retry-After did not set a cooldown on the rate limited route")
 	}
 }
 
@@ -1002,8 +1001,8 @@ func (p rotationTestProvider) FetchJobs(
 	return []db.Job{}, nil
 }
 
-func TestGreenhouseStopsProviderOnDestinationRestrictions(t *testing.T) {
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseStopsProviderOnAccessControl(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var restrictedHits, alternateHits int
 			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1043,8 +1042,8 @@ func TestGreenhouseStopsProviderOnDestinationRestrictions(t *testing.T) {
 	}
 }
 
-func TestGreenhouseFetchJobsStopsOnDestinationRestrictions(t *testing.T) {
-	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseFetchJobsStopsOnAccessControl(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var restrictedHits, alternateHits int
 			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

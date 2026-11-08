@@ -129,8 +129,8 @@ Storage and reuse:
 
 Gathered entries are not probed: source-reported uptime is a claim, not
 a verified transport check, and no job-board endpoint is contacted here.
-Destination rate limits and access restrictions still stop crawler work
-during runs.`,
+A rate limit cools a route and rotates, while access restrictions still
+stop crawler work during runs.`,
 		Example: `  # Gather from all four built-in sources straight into a file
   crawler proxy refresh -o proxies.json
 

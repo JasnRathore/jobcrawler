@@ -106,9 +106,11 @@ Pick exactly one provider with --greenhouse (default), --lever,
   --browse         serve the local browser for indexed jobs
 
 Word-list candidates are checked before brute-force candidates, and both
-honor --workers, --rps, and --timeout. A rate-limit, access-control, or
-recognized challenge response stops the provider for the run instead of
-retrying; brute-force checkpoints stay resumable with --resume.
+honor --workers, --rps, and --timeout. A rate limit cools the route that
+received it — retrying on another healthy route — and, once many routes
+hit it, pauses the provider briefly; an access-control or recognized
+challenge response still stops the provider for the run. Brute-force
+checkpoints stay resumable with --resume.
 
 Proxy routing is opt-in: pass --proxies FILE (or an HTTPS list URL) with
 a list you collected, and every healthy entry becomes a route. Workers
@@ -176,7 +178,7 @@ proxy-list format, and safety notes.`,
 	flags.IntVar(&opts.workers, "workers", opts.workers, "concurrent workers shared by all request modes")
 	flags.Float64Var(&opts.rps, "rps", opts.rps, "maximum aggregate requests per second across all workers")
 	flags.DurationVar(&opts.requestTimeout, "timeout", opts.requestTimeout, "per-request HTTP timeout (for example 10s or 1m)")
-	flags.DurationVar(&opts.cooldown, "cooldown", opts.cooldown, "legacy option; destination rate-limit responses now stop provider work instead of retrying")
+	flags.DurationVar(&opts.cooldown, "cooldown", opts.cooldown, "caps per-route cooling and the provider pause after repeated 429s; 403/406 still stop")
 	flags.StringVar(&opts.proxiesPath, "proxies", opts.proxiesPath, "JSON proxy list file or HTTPS URL whose healthy entries rotate; \"off\" uses direct egress")
 	flags.DurationVar(&opts.proxyReuseGap, "proxy-reuse-min", 0, "minimum gap before one proxy may handle another request (applies per route)")
 	flags.IntVar(&opts.proxyFailures, "proxy-failures", opts.proxyFailures, "evict a proxy from the rotation after this many consecutive failed requests")
@@ -191,7 +193,7 @@ proxy-list format, and safety notes.`,
 	flags.IntVar(&opts.maxSlugLength, "max", opts.maxSlugLength, "maximum brute-force slug length (13 technical maximum)")
 
 	for name, message := range map[string]string{
-		"cooldown":              "destination restriction responses stop provider work; automatic retries are disabled",
+		"cooldown":              "caps 429 cooling and pause; 403/406 still stop the run",
 		"proxy-probe-timeout":   "proxy health probes have been removed",
 		"allow-direct-fallback": "direct egress is chosen with --proxies off; rotation stays inside the supplied list",
 		"proxy-sources":         "legacy collection mode is disabled",

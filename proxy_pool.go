@@ -413,6 +413,8 @@ func (p *proxyPool) acquire(ctx context.Context) (*proxyPeer, error) {
 		wait := proxyInUsePollInterval
 		if !anyLeased && hasWait {
 			wait = nextWait
+			log.Printf("all %d healthy proxy routes are cooling; next one ready in %s",
+				p.healthy, nextWait.Round(time.Second))
 		}
 		p.mu.Unlock()
 

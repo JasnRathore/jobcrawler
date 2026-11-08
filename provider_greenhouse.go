@@ -79,13 +79,14 @@ func (greenhouseProvider) CheckCompany(
 		case status == http.StatusNotFound:
 			lease.release(proxyOutcomeOK, 0)
 			return false, nil
+		case status == http.StatusTooManyRequests:
+			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
+			lease.release(proxyOutcomeRateLimited, retryAfter)
+			limiter.recordRateLimit(providerGreenhouse, retryAfter)
+			lastFailure = "rate limited (HTTP 429)"
 		case isDestinationStopResponse(res):
 			stop := destinationStopError(providerGreenhouse, res)
-			if status == http.StatusTooManyRequests {
-				lease.release(proxyOutcomeRateLimited, stop.retryAfter)
-			} else {
-				lease.release(proxyOutcomeFailed, 0)
-			}
+			lease.release(proxyOutcomeFailed, 0)
 			return false, limiter.stopProvider(stop)
 		case status >= 500:
 			lease.release(proxyOutcomeFailed, 0)

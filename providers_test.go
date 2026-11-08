@@ -160,31 +160,33 @@ func TestWorkableProviderChecksAndIndexesJobs(t *testing.T) {
 	}
 }
 
-func TestWorkable429StopsWithoutRetry(t *testing.T) {
-	const cooldown = 80 * time.Millisecond
+func TestWorkable429RetriesWithoutStopping(t *testing.T) {
 	requests := 0
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		requests++
 		return providerResponse(req, http.StatusTooManyRequests, ""), nil
 	})}
-	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), cooldown)
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 80*time.Millisecond)
 
-	started := time.Now()
 	found, err := (workableProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
-	if !errors.Is(err, errProviderStopped) {
-		t.Fatalf("check error = %v, want provider stop", err)
-	}
 	if found {
-		t.Fatal("Workable company was found after a 429")
+		t.Fatal("Workable company was found after 429s")
 	}
-	if requests != 1 {
-		t.Fatalf("made %d requests, want 1", requests)
+	if errors.Is(err, errProviderStopped) {
+		t.Fatalf("check error = %v, want rate-limit retry failure, not a provider stop", err)
 	}
-	if elapsed := time.Since(started); elapsed >= cooldown {
-		t.Fatalf("stop waited %s for a retry cooldown", elapsed)
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Fatalf("check error = %v, want it to mention rate limiting", err)
 	}
-	if limiter.providerStop(providerWorkable) == nil {
-		t.Fatal("provider-wide stop was not recorded")
+	if requests != 4 {
+		t.Fatalf("made %d requests, want 4 bounded attempts", requests)
+	}
+	if limiter.providerStop(providerWorkable) != nil {
+		t.Fatal("provider-wide stop was recorded for a 429")
+	}
+	// Four hits stay below the cross-route breaker tolerance (5).
+	if !limiter.cooldownUntil.IsZero() {
+		t.Fatal("four 429s tripped the global pause, want rotation instead")
 	}
 }
 
@@ -273,8 +275,8 @@ func providerResponse(req *http.Request, status int, body string) *http.Response
 	}
 }
 
-func TestGreenhouseRestrictionStatusesStopWithoutRetry(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable, http.StatusTooManyRequests} {
+func TestGreenhouseAccessControlStatusesStopWithoutRetry(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			requests := 0
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -297,6 +299,37 @@ func TestGreenhouseRestrictionStatusesStopWithoutRetry(t *testing.T) {
 				t.Fatal("provider-wide stop was not recorded")
 			}
 		})
+	}
+}
+
+func TestGreenhouse429RetriesWithoutStopping(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return providerResponse(req, http.StatusTooManyRequests, ""), nil
+	})}
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
+
+	found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+	if found {
+		t.Fatal("Greenhouse company was found after rate limit responses")
+	}
+	if errors.Is(err, errProviderStopped) {
+		t.Fatalf("check error = %v, want rate-limit retry failure, not a provider stop", err)
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Fatalf("check error = %v, want it to mention rate limiting", err)
+	}
+	if requests != 4 {
+		t.Fatalf("made %d requests, want 4 bounded attempts", requests)
+	}
+	if limiter.providerStop(providerGreenhouse) != nil {
+		t.Fatal("provider-wide stop was recorded for a 429")
+	}
+	// Four hits stay below the cross-route breaker tolerance (5):
+	// rotation handles them, no global pause yet.
+	if !limiter.cooldownUntil.IsZero() {
+		t.Fatal("four 429s tripped the global pause, want rotation instead")
 	}
 }
 
@@ -410,5 +443,43 @@ func TestProviderStopErrorReportsFixedRetryTime(t *testing.T) {
 
 	if got := stop.Error(); !strings.Contains(got, retryAt.Format(time.RFC3339)) {
 		t.Fatalf("provider stop error = %q, want fixed retry time %s", got, retryAt.Format(time.RFC3339))
+	}
+}
+
+func TestRequestLimiterRateLimitBreakerPausesProvider(t *testing.T) {
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 30*time.Second)
+	limiter.rateLimitTolerance = 2
+	limiter.rateLimitWindow = time.Minute
+
+	if limiter.recordRateLimit(providerWorkable, 0) {
+		t.Fatal("first 429 tripped the global pause, want rotation instead")
+	}
+	if !limiter.cooldownUntil.IsZero() {
+		t.Fatal("provider paused after a single 429")
+	}
+	if !limiter.recordRateLimit(providerWorkable, 0) {
+		t.Fatal("second 429 within the window did not trip the global pause")
+	}
+	if limiter.cooldownUntil.Before(time.Now()) {
+		t.Fatal("global pause did not engage after repeated 429s")
+	}
+	if limiter.providerStop(providerWorkable) != nil {
+		t.Fatal("provider-wide stop was recorded for 429s")
+	}
+	// Hits reset after the trip: the next burst starts fresh.
+	if limiter.recordRateLimit(providerWorkable, 0) {
+		t.Fatal("429 right after the trip re-tripped the pause, want reset counter")
+	}
+}
+
+func TestRequestLimiterRateLimitHitsExpireOutsideWindow(t *testing.T) {
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 30*time.Second)
+	limiter.rateLimitTolerance = 2
+	limiter.rateLimitWindow = 20 * time.Millisecond
+
+	limiter.recordRateLimit(providerWorkable, 0)
+	time.Sleep(30 * time.Millisecond)
+	if limiter.recordRateLimit(providerWorkable, 0) {
+		t.Fatal("expired 429 still counted toward the pause")
 	}
 }

@@ -448,7 +448,7 @@ func TestBruteForceDestinationStopIsNotRetriedOrCheckpointed(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		requests++
 		return &http.Response{
-			StatusCode: http.StatusTooManyRequests,
+			StatusCode: http.StatusForbidden,
 			Header:     http.Header{"Retry-After": []string{"30"}},
 			Body:       io.NopCloser(strings.NewReader("")),
 			Request:    req,
@@ -471,5 +471,53 @@ func TestBruteForceDestinationStopIsNotRetriedOrCheckpointed(t *testing.T) {
 	}
 	if position != 0 {
 		t.Fatalf("checkpoint advanced to %d after a destination stop, want 0", position)
+	}
+}
+
+func TestBruteForce429RotatesWithoutStopping(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.New(ctx, filepath.Join(t.TempDir(), "rate-limited.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Retry-After": []string{"1"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	pool := newCheckPool(ctx, client, nil, newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0), database, nil, providerGreenhouse, 1)
+
+	if err := runBruteForce(ctx, pool, make(map[string]struct{}), database, 1, 1, true, filepath.Join(t.TempDir(), "failed.txt")); err != nil {
+		t.Fatalf("run error = %v, want the 429 to rotate into a completed check", err)
+	}
+	pool.close()
+
+	if requests != int(bruteCount(1, 1))+1 {
+		t.Fatalf("made %d requests, want each of the %d candidates once plus the retried 429", requests, bruteCount(1, 1))
+	}
+	if pool.providerStop() != nil {
+		t.Fatal("provider-wide stop was recorded for a 429")
+	}
+	position, err := database.StartProviderBruteCheckpoint(ctx, providerGreenhouse, 1, 1, alphabet, bruteCount(1, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != bruteCount(1, 1) {
+		t.Fatalf("checkpoint advanced to %d, want %d: every candidate completed after the 429", position, bruteCount(1, 1))
 	}
 }

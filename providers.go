@@ -32,6 +32,15 @@ func setStandardHeaders(req *http.Request) {
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 }
 
+// rateLimitWindowDefault and rateLimitToleranceDefault tune the cross-route
+// 429 circuit breaker: when this many rate limits arrive within the
+// window, the provider pauses briefly so the pool breathes instead of
+// strip-mining every route.
+const (
+	rateLimitWindowDefault    = 60 * time.Second
+	rateLimitToleranceDefault = 5
+)
+
 type requestLimiter struct {
 	*rate.Limiter
 	cooldown time.Duration
@@ -40,6 +49,10 @@ type requestLimiter struct {
 	mu            sync.Mutex
 	cooldownUntil time.Time
 	stopped       map[string]*providerStopError
+
+	rateLimitWindow    time.Duration
+	rateLimitTolerance int
+	rateLimitHits      map[string][]time.Time
 }
 
 func newRequestLimiter(limiter *rate.Limiter, cooldown time.Duration) *requestLimiter {
@@ -52,6 +65,10 @@ func newRequestLimiter(limiter *rate.Limiter, cooldown time.Duration) *requestLi
 		cooldown: cooldown,
 		maxBurst: burst,
 		stopped:  make(map[string]*providerStopError),
+
+		rateLimitWindow:    rateLimitWindowDefault,
+		rateLimitTolerance: rateLimitToleranceDefault,
+		rateLimitHits:      make(map[string][]time.Time),
 	}
 }
 
@@ -105,11 +122,17 @@ func (l *requestLimiter) StartCooldownForStatusAndRetryAfter(provider string, st
 	if retryAfter > cooldownDur {
 		cooldownDur = retryAfter
 	}
-	if cooldownDur <= 0 {
+	return l.startCooldownDur(provider, status, cooldownDur)
+}
+
+// startCooldownDur pauses new requests for the provider for dur, clamping
+// burst so workers wake up smoothly without a surge. Returns the wait.
+func (l *requestLimiter) startCooldownDur(provider string, status int, dur time.Duration) time.Duration {
+	if dur <= 0 {
 		return 0
 	}
 	now := time.Now()
-	until := now.Add(cooldownDur)
+	until := now.Add(dur)
 	l.mu.Lock()
 	prevUntil := l.cooldownUntil
 	shouldLog := false
@@ -130,6 +153,58 @@ func (l *requestLimiter) StartCooldownForStatusAndRetryAfter(provider string, st
 		log.Printf("%s returned HTTP %d; pausing requests for %s", provider, status, wait.Round(time.Second))
 	}
 	return wait
+}
+
+// recordRateLimit notes one HTTP 429 for the provider. The first few
+// rate limits within the window just cool their route while requests
+// rotate to other healthy proxies; once enough pile up within the window
+// the provider pauses briefly (bounded by --cooldown) so the whole pool
+// breathes instead of hammering the destination. Returns true when the
+// pause was triggered. A 429 never stops the run.
+func (l *requestLimiter) recordRateLimit(provider string, retryAfter time.Duration) bool {
+	if l == nil {
+		return false
+	}
+	tolerance := l.rateLimitTolerance
+	if tolerance <= 0 {
+		tolerance = rateLimitToleranceDefault
+	}
+	window := l.rateLimitWindow
+	if window <= 0 {
+		window = rateLimitWindowDefault
+	}
+	now := time.Now()
+	l.mu.Lock()
+	if l.rateLimitHits == nil {
+		l.rateLimitHits = make(map[string][]time.Time)
+	}
+	hits := append(l.rateLimitHits[provider], now)
+	cutoff := now.Add(-window)
+	filtered := make([]time.Time, 0, len(hits))
+	for _, hit := range hits {
+		if hit.After(cutoff) {
+			filtered = append(filtered, hit)
+		}
+	}
+	if len(filtered) < tolerance {
+		l.rateLimitHits[provider] = filtered
+		l.mu.Unlock()
+		return false
+	}
+	l.rateLimitHits[provider] = nil
+	l.mu.Unlock()
+
+	pause := retryAfter
+	if pause < time.Second {
+		pause = time.Second
+	}
+	if l.cooldown > 0 && pause > l.cooldown {
+		pause = l.cooldown
+	}
+	l.startCooldownDur(provider, http.StatusTooManyRequests, pause)
+	log.Printf("%s rate limited %d times in %s; pausing requests for %s and rotating to other routes",
+		provider, tolerance, window, pause)
+	return true
 }
 
 var errProviderStopped = errors.New("provider stopped after a destination restriction signal")
@@ -385,14 +460,19 @@ func fetchProviderResponse(
 				retry = true
 				break
 			}
+			if res.StatusCode == http.StatusTooManyRequests {
+				res.Body.Close()
+				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
+				lease.release(proxyOutcomeRateLimited, retryAfter)
+				limiter.recordRateLimit(name, retryAfter)
+				lastFailure = "rate limited (HTTP 429)"
+				retry = true
+				break
+			}
 			if isDestinationStopResponse(res) {
 				res.Body.Close()
 				stop := destinationStopError(name, res)
-				if res.StatusCode == http.StatusTooManyRequests {
-					lease.release(proxyOutcomeRateLimited, stop.retryAfter)
-				} else {
-					lease.release(proxyOutcomeFailed, 0)
-				}
+				lease.release(proxyOutcomeFailed, 0)
 				return providerHTTPResponse{}, limiter.stopProvider(stop)
 			}
 			if res.StatusCode == http.StatusNotFound && provider.FallbackOnNotFound() && i+1 < len(endpoints) {
