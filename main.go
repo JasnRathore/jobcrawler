@@ -93,35 +93,58 @@ func newRootCommandWithRunner(runner func(*cliOptions, string) error) *cobra.Com
 	root := &cobra.Command{
 		Use:   "crawler",
 		Short: "Discover and update job-board data",
-		Long: `Crawler finds company boards on supported applicant-tracking platforms,
-indexes their job listings, and provides a local browser for searching and
-bookmarking those listings.
+		Long: `Crawler checks company slugs against applicant-tracking (ATS) providers,
+saves discovered boards to the local database, refreshes their job
+listings, and serves a browser for searching and bookmarking those jobs.
 
-Choose one provider for company discovery. Greenhouse is the default except
-that --words requires an explicit provider. Word-list and brute-force
-discovery can be combined; word-list candidates run first. Requests are
-rate-limited, and rate-limit, access-control, or recognized challenge
-responses stop discovery for that provider. Only query providers and company
-boards you are authorized to access; keep brute-force ranges small.
+Pick exactly one provider with --greenhouse (default), --lever,
+--levereu, --workable, or --ashbyhq, and run one work mode at a time:
 
-Proxy lists are manually supplied with --proxies. One eligible route is
-selected and pinned for the run; proxies are not automatically gathered or
-rotated. See README.md for setup, workflows, database configuration, and
-proxy-list examples.`,
+  --words FILE     check slugs generated from a company-name list
+  --brute          check every lowercase slug in a length range
+  --update --jobs  refresh stored listings for every known company
+  --browse         serve the local browser for indexed jobs
+
+Word-list candidates are checked before brute-force candidates, and both
+honor --workers, --rps, and --timeout. A rate-limit, access-control, or
+recognized challenge response stops the provider for the run instead of
+retrying; brute-force checkpoints stay resumable with --resume.
+
+Proxy routing is opt-in: pass --proxies FILE (or an HTTPS list URL) with
+a list you collected, and every healthy entry becomes a route. Workers
+rotate across the following routes (least-recently-used first), routes
+that keep failing are evicted after --proxy-failures consecutive
+failures, and the run stops when no route remains instead of falling
+back to your direct connection. Use "crawler proxy refresh" to gather
+the four built-in public lists into one reviewable file for --proxies,
+or supply your own list. Use "crawler proxy filter" to live-check a
+list against a neutral endpoint and keep only routes that tunnel.
+Only send traffic you are authorized to send,
+and keep brute-force ranges small. See README.md for workflows, the
+proxy-list format, and safety notes.`,
 		Example: `  # Discover company boards from a word list
   crawler --greenhouse --words companies.txt
+
+  # Route the run through a rotating proxy pool from a list you collected
+  crawler --greenhouse --words companies.txt --proxies proxies.json
+
+  # Keep the routes that proved healthy, then reuse them later
+  crawler --brute --max 1 --proxies proxies.json --proxy-save proven.json
+
+  # Gather the four built-in public proxy lists into one file
+  crawler proxy refresh > proxies.json
+
+  # Live-check a gathered list; survivors are in the same JSON shape
+  crawler proxy filter -o proven.json proxies.json
 
   # Try a deliberately small slug range and checkpoint progress for later
   crawler --lever --brute --min 1 --max 1 --resume
 
-  # Refresh jobs for every discovered company
+  # Refresh jobs for every discovered company across all providers
   crawler --update --jobs
 
   # Browse and bookmark indexed jobs
-  crawler --browse
-
-  # Use one manually supplied proxy list for this run
-  crawler --greenhouse --words companies.txt --proxies proxies.json`,
+  crawler --browse`,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -133,8 +156,8 @@ proxy-list examples.`,
 		},
 	}
 	flags := root.Flags()
-	flags.StringVar(&opts.words, "words", "", "file with company names or slugs, one per line")
-	flags.BoolVar(&opts.brute, "brute", false, "also brute-force slugs (low priority)")
+	flags.StringVar(&opts.words, "words", "", "file with company names or slugs, one per line (generates variants)")
+	flags.BoolVar(&opts.brute, "brute", false, "also brute-force slugs in the --min/--max length range (low priority)")
 	flags.BoolVar(&opts.bench, "bench", false, "benchmark requests without modifying local.db")
 	for _, name := range registeredProviders() {
 		help := "select " + providerDisplayName(name) + " for company discovery"
@@ -146,31 +169,31 @@ proxy-list examples.`,
 		flags.BoolVar(opts.providerFlags[name], name, false, help)
 	}
 	flags.BoolVar(&opts.resume, "resume", false, "resume or checkpoint brute-force progress (requires --brute)")
-	flags.BoolVar(&opts.update, "update", false, "update indexed data")
-	flags.BoolVar(&opts.updateJobs, "jobs", false, "fetch and refresh jobs for all known companies")
+	flags.BoolVar(&opts.update, "update", false, "update indexed data (always pair with --jobs)")
+	flags.BoolVar(&opts.updateJobs, "jobs", false, "fetch and refresh jobs for all known companies (requires --update)")
 	flags.BoolVar(&opts.browse, "browse", false, "launch the local job browser")
-	flags.StringVar(&opts.browseAddress, "addr", opts.browseAddress, "job browser listen address")
-	flags.IntVar(&opts.workers, "workers", opts.workers, "concurrent workers")
-	flags.Float64Var(&opts.rps, "rps", opts.rps, "max requests per second")
-	flags.DurationVar(&opts.requestTimeout, "timeout", opts.requestTimeout, "HTTP request timeout (for example 10s or 1m)")
+	flags.StringVar(&opts.browseAddress, "addr", opts.browseAddress, "job browser listen address, for example 127.0.0.1:9090")
+	flags.IntVar(&opts.workers, "workers", opts.workers, "concurrent workers shared by all request modes")
+	flags.Float64Var(&opts.rps, "rps", opts.rps, "maximum aggregate requests per second across all workers")
+	flags.DurationVar(&opts.requestTimeout, "timeout", opts.requestTimeout, "per-request HTTP timeout (for example 10s or 1m)")
 	flags.DurationVar(&opts.cooldown, "cooldown", opts.cooldown, "legacy option; destination rate-limit responses now stop provider work instead of retrying")
-	flags.StringVar(&opts.proxiesPath, "proxies", opts.proxiesPath, "manual proxy list; selects one eligible route and pins it for the run, or \"off\"")
-	flags.DurationVar(&opts.proxyReuseGap, "proxy-reuse-min", 0, "minimum gap before the pinned proxy may handle another request")
-	flags.IntVar(&opts.proxyFailures, "proxy-failures", opts.proxyFailures, "stop using the pinned route after this many consecutive failures")
+	flags.StringVar(&opts.proxiesPath, "proxies", opts.proxiesPath, "JSON proxy list file or HTTPS URL whose healthy entries rotate; \"off\" uses direct egress")
+	flags.DurationVar(&opts.proxyReuseGap, "proxy-reuse-min", 0, "minimum gap before one proxy may handle another request (applies per route)")
+	flags.IntVar(&opts.proxyFailures, "proxy-failures", opts.proxyFailures, "evict a proxy from the rotation after this many consecutive failed requests")
 	flags.DurationVar(&opts.proxyProbeTimeout, "proxy-probe-timeout", opts.proxyProbeTimeout, "deprecated; proxy health probes are disabled")
-	flags.StringVar(&opts.proxySavePath, "proxy-save", "", "write the selected proxy and its run stats to this JSON file")
-	flags.BoolVar(&opts.allowDirectFallback, "allow-direct-fallback", false, "deprecated; direct fallback is disabled, use --proxies off to select direct mode")
+	flags.StringVar(&opts.proxySavePath, "proxy-save", "", "write surviving proxies and their run stats to this JSON file for reuse with --proxies")
+	flags.BoolVar(&opts.allowDirectFallback, "allow-direct-fallback", false, "deprecated; direct egress is selected with --proxies off")
 	flags.StringVar(&opts.collectPath, "collect-proxies", "", "disabled legacy option; proxy collection no longer probes job-board endpoints")
 	flags.StringVar(&opts.proxySources, "proxy-sources", "", "deprecated legacy collection input; collection mode is disabled")
 	flags.IntVar(&opts.collectIterations, "collect-iterations", opts.collectIterations, "deprecated legacy collection option")
 	flags.BoolVar(&opts.collectUniqueHosts, "collect-unique-hosts", false, "deprecated legacy collection option")
-	flags.IntVar(&opts.minSlugLength, "min", opts.minSlugLength, "minimum slug length")
-	flags.IntVar(&opts.maxSlugLength, "max", opts.maxSlugLength, "maximum slug length")
+	flags.IntVar(&opts.minSlugLength, "min", opts.minSlugLength, "minimum brute-force slug length")
+	flags.IntVar(&opts.maxSlugLength, "max", opts.maxSlugLength, "maximum brute-force slug length (13 technical maximum)")
 
 	for name, message := range map[string]string{
 		"cooldown":              "destination restriction responses stop provider work; automatic retries are disabled",
 		"proxy-probe-timeout":   "proxy health probes have been removed",
-		"allow-direct-fallback": "routes remain pinned; select direct mode before a run with --proxies off",
+		"allow-direct-fallback": "direct egress is chosen with --proxies off; rotation stays inside the supplied list",
 		"proxy-sources":         "legacy collection mode is disabled",
 		"collect-iterations":    "legacy collection mode is disabled",
 		"collect-unique-hosts":  "legacy collection mode is disabled",
@@ -179,6 +202,7 @@ proxy-list examples.`,
 	}
 
 	root.SetHelpFunc(writeRootHelp)
+	root.AddCommand(newProxyCommand())
 
 	return root
 }
@@ -206,6 +230,18 @@ func writeRootHelp(cmd *cobra.Command, _ []string) {
 	fmt.Fprintf(out, "%s\n\n%s\n\nUsage:\n  %s [flags]\n", cmd.Short, strings.TrimSpace(cmd.Long), cmd.CommandPath())
 	for _, group := range cliHelpFlagGroups {
 		writeCLIHelpFlagGroup(out, cmd, group)
+	}
+	var commands []*cobra.Command
+	for _, subcommand := range cmd.Commands() {
+		if !subcommand.Hidden && subcommand.Name() != "help" && subcommand.Name() != "completion" {
+			commands = append(commands, subcommand)
+		}
+	}
+	if len(commands) > 0 {
+		fmt.Fprintln(out, "\nCommands:")
+		for _, subcommand := range commands {
+			fmt.Fprintf(out, "  %-12s %s\n", subcommand.Name(), subcommand.Short)
+		}
 	}
 	if example := strings.TrimSpace(cmd.Example); example != "" {
 		fmt.Fprintf(out, "\nExamples:\n%s\n", strings.TrimRight(cmd.Example, "\n"))

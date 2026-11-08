@@ -397,6 +397,9 @@ func fetchGreenhouseJobs(
 		}
 		lease, leaseErr := acquireLease(ctx, pool, client)
 		if leaseErr != nil {
+			if errors.Is(leaseErr, errProxyExhausted) {
+				leaseErr = stopProviderForProxyExhaustion(limiter, providerGreenhouse)
+			}
 			return nil, leaseErr
 		}
 		if err := limiter.waitForProvider(ctx, providerGreenhouse); err != nil {

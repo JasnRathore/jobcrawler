@@ -49,7 +49,9 @@ than expecting the default invocation to scan companies.
 | `providers.go`, `provider_*.go` | Shared provider behavior and provider-specific API adapters |
 | `bruteforce.go` | Concurrent candidate checks, failure output, and brute checkpoints |
 | `jobs.go` | Job fetching/updating and the local browser server |
-| `proxy_pool.go` | Loading and pinning one manually supplied proxy route |
+| `proxy_pool.go` | Loading the supplied proxy list and rotating checks across healthy routes |
+| `proxy_refresh.go` | Gathering four public sources and normalizing their formats for review |
+| `proxy_filter.go` | Live-checking proxy lists against a neutral endpoint; keeping proven routes |
 | `database_config.go` | Local `.env` loading and local/remote database configuration |
 | `db/` | SQLite/Turso database access, schema initialization, migrations, queries |
 | `*_test.go` | CLI, provider, proxy, database, and workflow tests |
@@ -131,6 +133,9 @@ go run . --workable --words companies.txt --workers 8 --rps 2
 
 # Fetch jobs for every discovered company, across all providers
 go run . --update --jobs
+
+# Route a run through a rotating proxy pool from a list you collected
+go run . --greenhouse --words companies.txt --proxies proxies.json
 
 # Browse indexed jobs
 go run . --browse
@@ -262,23 +267,11 @@ Benchmark mode uses a temporary database and prints request, retry, status,
 latency, and company-check statistics when the run finishes. It cannot be
 combined with `--update`/`--jobs`, `--browse`, or `--resume`.
 
-## Manual proxy routing
+## Proxy lists and rotation
 
-For traffic you are authorized to send through a proxy, `--proxies` accepts
-a local JSON list or an explicitly supplied HTTP(S) list URL. The crawler
-selects one eligible entry using the list's reported uptime and pins that
-route for the entire run. Source health claims are not verified; the crawler
-does not probe proxy candidates against job-board endpoints, rotate egress,
-or fall back to another route. A destination `429`, `403`, `406`, or
-recognized challenge stops provider work for the run.
-
-Automatic public-proxy gathering and automatic use in discovery are not
-implemented. The legacy `--collect-proxies` mode is disabled because it
-probed candidates against job-board endpoints. `--allow-direct-fallback` is
-also disabled; choose direct mode before starting by leaving `--proxies` off.
-See `DESIGN.md` for the current routing behavior.
-
-For a local list, use this JSON shape:
+The crawler only sends proxied traffic through a list you supply explicitly
+with `--proxies`. A list is either a local JSON file or an HTTP(S) URL
+returning a supported JSON list with this shape:
 
 ```json
 [
@@ -292,23 +285,143 @@ For a local list, use this JSON shape:
 ]
 ```
 
-Replace the example endpoint with a proxy you are authorized to use. The list
-may also be supplied as an HTTP(S) URL returning a supported JSON list. At
-least one entry must be marked alive and use `http` or `socks5`; when an
-anonymity value is present, it must be `elite`. The highest source-reported
-uptime is selected. This metadata is not a live health check or safety
-guarantee.
+Replace the example endpoint with a proxy you are authorized to use. Each
+entry must be `alive`, use `http` or `socks5`, and carry an `elite` (or
+absent) anonymity value when one is set; duplicate URLs are collapsed and
+entries stay ordered by reported uptime (best first). This metadata is a
+source claim, not a live health check or safety guarantee; the crawler
+never probes candidate proxies against job-board endpoints.
 
 ```powershell
 go run . --greenhouse --words companies.txt --proxies proxies.json
 go run . --greenhouse --words companies.txt --proxies https://example.net/list.json
 ```
 
-If that one route becomes unavailable or reaches `--proxy-failures`, the run
-fails closed instead of selecting another proxy or sending traffic directly.
-`--proxies off` disables the application-managed proxy list; Go may still
-honor `HTTP_PROXY`/`HTTPS_PROXY` environment settings. `--browse` only reads
-local or remote database content and does not use a proxy.
+### How the pool rotates and evicts
+
+Every eligible entry becomes a route in the run's proxy pool:
+
+- Workers lease one route per request, exclusively, and always take the
+  route that was used least recently, so requests spread across the whole
+  list instead of pinning one proxy.
+- A `429` applies the destination's `Retry-After` as a per-route cooldown
+  (floored at one second, capped by `--cooldown`); requests move to other
+  healthy routes while it cools down. Destination `429`, `403`, `406`,
+  or recognized challenge responses still stop the provider for the run.
+- Failures and destination policy are kept apart: transport errors and
+  5xx responses mark the route failed and the immediate retry rotates to
+  another route. `--proxy-reuse-min` enforces a per-route gap between
+  requests.
+- A route that reaches `--proxy-failures` (default `5`) consecutive
+  failures is evicted and no longer leased; the run logs the eviction and
+  the remaining healthy count, and workers keep rotating through
+  survivors.
+- If every route is evicted, the run stops for that provider (fail
+  closed) instead of silently falling back to your direct connection.
+  `--proxies off` selects direct egress before the run starts, and
+  `--browse` only reads database content and never uses a proxy.
+
+`proxy refresh` gathers lists from the four built-in public sources in
+parallel and normalizes them for review; `proxy filter` live-checks a
+list and keeps only routes that tunnel (see the next section). The legacy
+`--collect-proxies` mode remains
+disabled because it probed candidates against job-board endpoints, and
+`--allow-direct-fallback` is rejected; choose direct mode before starting
+with `--proxies off`. See `DESIGN.md` for routing behavior.
+
+## How gathered proxies are stored and reused
+
+`crawler proxy refresh` fetches the HProxy, Proxifly, ProxyScrape, and
+Geonode lists concurrently, parses their JSON and text formats, filters to
+eligible credential-free entries, and writes one normalized JSON object to
+**stdout**:
+
+```json
+{
+  "retrievedAt": "2026-01-01T00:00:00Z",
+  "sources": [{"name": "HProxy", "count": 250}, {"name": "Geonode", "error": "..."}],
+  "proxies": [{"proxy": "http://198.51.100.7:8080", "protocol": "http", "alive": true, "anonymity": "elite", "uptime": 99.1}]
+}
+```
+
+Storage is explicit: the report goes to **stdout**, or to the file you
+choose with `-o FILE` (the same JSON, written through a temp-file rename
+so a crash cannot corrupt a previous gather). Nothing else — no database,
+no cache — is stored:
+
+1. **Capture the list.** Write the report to a file; the timestamped
+   `retrievedAt` and per-source counts/errors travel with the proxies, so
+   a failed source stays visible later:
+
+   ```powershell
+   go run . proxy refresh -o proxies.json
+   go run . proxy refresh --source https://example.net/list.json -o proxies.json
+   go run . proxy refresh --limit 2000 --timeout 30s -o proxies.json
+
+   # The same JSON via stdout redirection, for piping
+   go run . proxy refresh > proxies.json
+   go run . proxy refresh -o -
+   ```
+
+2. **Review and edit.** The file is directly readable; remove entries you
+   are not authorized to use. The `proxies` array is what `--proxies`
+   loads, and the object wrapper (with `sources` metadata) is accepted as
+   is, so you do not need to reformat the file after editing.
+
+3. **Use the list in a run.** Point `--proxies` at the file; every
+   eligible entry rotates, failing routes are evicted, and the run stops
+   cleanly if all routes die:
+
+   ```powershell
+   go run . --greenhouse --words companies.txt --proxies proxies.json
+   go run . --lever --brute --min 1 --max 1 --proxies proxies.json --resume
+   go run . --update --jobs --proxies proxies.json
+   ```
+
+4. **Keep only proven routes.** Add `--proxy-save` to any proxied run;
+   every five minutes and at shutdown it writes the routes that survived
+   the run — with observed request, success, and failure counts — sorted
+   best first. That saved file is the same JSON list shape, so later runs
+   can use it directly:
+
+   ```powershell
+   go run . --greenhouse --words companies.txt --proxies proxies.json --proxy-save proven.json
+   go run . --workable --words companies.txt --proxies proven.json
+   ```
+
+The refresh command has no scheduler and no automatic crawler integration,
+by design: gather, review, then pass the file explicitly.
+
+### Filter a list before a run
+
+Gathered entries are unverified: source-reported `alive`/`elite` claims
+leave dead ports, HTTP-only bots (which answer `400` to `CONNECT`), ACL
+blocks, and captive-portal replies in the pool, and each of those surfaces
+at run time as a `transport error` against a healthy destination. The
+`proxy filter` command collapses that noise into a short proven list:
+
+```powershell
+go run . proxy filter -o proven.json proxies.json
+go run . proxy filter --failures dead.json proxies.json > proven.json
+go run . proxy filter --rounds 1 --concurrency 128 --timeout 5s -o proven.json proxies.json
+```
+
+Each eligible entry gets `--rounds` HTTPS requests to a neutral
+connectivity endpoint through its own CONNECT tunnel (never a job-board
+destination — verification proves transport health without touching
+targets). A proxy whose tunnel or TLS fails, or that answers with its own
+error status, counts as a failure. By default a candidate survives on its
+first success; `--all-rounds` requires every attempt to pass.
+`--concurrency` (default `64`) and `--timeout` (default `10s`) bound the
+probe load, and `--unique-hosts` keeps only the best entry per host.
+
+Survivors are written with measured attempt statistics (`requests`,
+`successes`, `failures`, `response_ms`) in the same JSON list shape that
+`--proxies` loads, strongest first, so the next run starts with the best
+proven routes. Dead candidates can be parked with `--failures FILE` in a
+review file whose entries are marked `alive: false` and can therefore
+never be loaded as a run list. Only keep and use proxies you are
+authorized to use.
 
 ## Flags
 
@@ -332,11 +445,11 @@ reference.
 | `--rps N` | `50` | Maximum request rate; must be greater than `0` |
 | `--timeout DURATION` | `10s` | Maximum duration of an individual HTTP request, including reading its response body; e.g. `30s` or `2m`; must be greater than `0` |
 | `--cooldown DURATION` | `2m` | Deprecated compatibility option; destination restriction responses stop provider work instead of retrying |
-| `--proxies FILE\|URL` | `off` | Select one eligible manual proxy entry and pin it for the run; no rotation |
-| `--proxy-reuse-min DURATION` | `0s` | Minimum gap before the pinned proxy can handle another request |
-| `--proxy-failures N` | `5` | Stop using the pinned route after this many consecutive failures |
+| `--proxies FILE\|URL` | `off` | Load every eligible entry as a route and rotate requests across them; `off` selects direct egress |
+| `--proxy-reuse-min DURATION` | `0s` | Minimum gap before one proxy may handle another request (applies per route) |
+| `--proxy-failures N` | `5` | Evict a proxy from the rotation after this many consecutive failed requests |
 | `--proxy-probe-timeout DURATION` | `3s` | Deprecated; proxy health probes are disabled |
-| `--proxy-save FILE` | Off | Save the selected proxy and its run stats to `FILE` |
+| `--proxy-save FILE` | Off | Save the proxies that survived the run, with observed stats, for reuse with `--proxies` |
 | `--collect-proxies FILE` | Off | Disabled legacy option; returns an error and does not probe job-board endpoints |
 | `--proxy-sources LIST` | Off | Deprecated legacy collection input; collection mode is disabled |
 | `--collect-iterations N` | `2` | Deprecated legacy collection option |
@@ -374,6 +487,8 @@ described above.
 | Brute force runs much longer than expected | Reduce the length range. Candidate count grows exponentially with each extra character. |
 | A job update stops after a destination response | The run is resumable and completed work is retained. Follow the destination's published access policy; if a `Retry-After` time is printed, wait until then before rerunning `--update --jobs`. |
 | `no eligible proxy entries` | Check the JSON structure, `alive`, `protocol`, and `anonymity` values. Proxy source metadata is not verified by probing targets. |
+| `no eligible proxy entries in FILE` | The list had entries, but none passed the eligibility filter; keep entries `alive`, `http`/`socks5`, and `elite` (or no anonymity value). |
+| `greenhouse stopped: no healthy proxy route remains` | All `--proxies` routes failed repeatedly and the run stopped instead of going direct; collect fresh lists with `crawler proxy refresh`, review the file, and rerun (add `--resume` to continue brute-force checkpoints). |
 | Remote database configuration fails | Set `DB_MODE=remote`, `TURSO_DATABASE_URL`, and `TURSO_AUTH_TOKEN`; environment values override `.env`. |
 | Browser address is already in use | Choose another local port, for example `--browse --addr 127.0.0.1:9090`. |
 

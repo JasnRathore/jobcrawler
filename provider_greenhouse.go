@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -41,6 +42,9 @@ func (greenhouseProvider) CheckCompany(
 		}
 		lease, leaseErr := acquireLease(ctx, pool, client)
 		if leaseErr != nil {
+			if errors.Is(leaseErr, errProxyExhausted) {
+				leaseErr = stopProviderForProxyExhaustion(limiter, providerGreenhouse)
+			}
 			return false, leaseErr
 		}
 		if err := limiter.waitForProvider(ctx, providerGreenhouse); err != nil {

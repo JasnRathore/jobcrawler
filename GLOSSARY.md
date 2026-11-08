@@ -35,7 +35,10 @@ A proxy candidate with a supported endpoint, a retrieval time within the configu
 An eligible proxy through which an ordinary authorized request has completed successfully. Source-reported health is not transport verification.
 
 **Run route**:
-The single direct or proxy egress selected before target traffic begins and pinned for the run, except for a proven pre-send transport failure.
+A direct or proxy egress usable for target requests during a run. With a supplied proxy list, every healthy entry becomes a route and workers lease routes exclusively, rotating least-recently-used first; a route that keeps failing is evicted, and exhaustion stops the run instead of changing egress to direct.
+
+**Rotation**:
+Handing out pool routes to workers so successive requests use different healthy proxies. Failed requests rotate the retry to another route; destination signals (429, 403, 406, challenges) are honored as provider responses and stop the provider for the run rather than switching egress to bypass them.
 
 **Proxy cache**:
 The local, time-bounded record of normalized candidates and their source/retrieval metadata.

@@ -31,8 +31,13 @@ func TestRootCommandHelpAndNoArgumentDefaults(t *testing.T) {
 	for _, want := range []string{
 		"Usage:", "Provider selection:", "Company discovery:", "Request controls:",
 		"Manual proxy routing:", "Other modes and browser:", "Legacy and disabled options:",
-		"Examples:", "crawler --greenhouse --words companies.txt",
+		"Commands:", "proxy", "Examples:", "crawler --greenhouse --words companies.txt",
+		"crawler proxy refresh > proxies.json",
 		"--words string", "--brute", "--greenhouse", "--collect-proxies",
+		// Rotating pool guidance in the overview and examples.
+		"Workers", "rotate across", "--proxy-failures",
+		"--proxies proxies.json --proxy-save proven.json",
+		"Refresh jobs for every discovered company",
 	} {
 		if !strings.Contains(help.String(), want) {
 			t.Errorf("help output missing %q", want)
@@ -75,6 +80,27 @@ func TestRootCommandHelpAndNoArgumentDefaults(t *testing.T) {
 	}
 	if got.workers != 64 || got.rps != 50 || got.proxiesPath != "off" {
 		t.Errorf("unexpected CLI defaults: workers=%d rps=%g proxies=%q", got.workers, got.rps, got.proxiesPath)
+	}
+}
+
+func TestProxyRefreshCommandHelpDocumentsBuiltInSourcesAndNoRouting(t *testing.T) {
+	root := newRootCommand()
+	var help bytes.Buffer
+	root.SetOut(&help)
+	root.SetErr(&help)
+	root.SetArgs([]string{"proxy", "refresh", "--help"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"HProxy", "Proxifly", "ProxyScrape", "Geonode", "--source", "--limit",
+		"stdout", "not probed", "Destination rate limits",
+		// Storage and reuse guidance.
+		"Storage and reuse", "--proxies FILE", "--proxy-save", "Examples:",
+	} {
+		if !strings.Contains(help.String(), expected) {
+			t.Errorf("proxy refresh help missing %q:\n%s", expected, help.String())
+		}
 	}
 }
 

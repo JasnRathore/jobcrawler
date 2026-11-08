@@ -5,8 +5,10 @@
 | Capability | Responsibility | Depends on |
 |---|---|---|
 | `cobra-cli` | Preserve current root invocations while introducing Cobra. | — |
-| `safe-manual-route` | Use only an explicitly configured manual route; stop on destination limits/restrictions without failover. | `cobra-cli` |
-| `verification` | Update usage docs and verify CLI compatibility and route safety. | `safe-manual-route` |
+| `safe-manual-route` | Use only explicitly configured manual routes; honor destination limits/restrictions. | `cobra-cli` |
+| `rotating-pool` | Lease every eligible supplied route exclusively with LRU rotation, evict dead routes, and stop the run (fail closed) on exhaustion. | `cobra-cli` |
+| `proxy-filter` | Live-check a supplied list against a neutral endpoint (never job boards); write proven routes best-first and dead candidates marked not alive. | `rotating-pool` |
+| `verification` | Update usage docs and verify CLI compatibility, route safety, and the full Go suite. | `rotating-pool` |
 
 Build `cobra-cli` first, then integrate and verify `safe-manual-route`.
 
@@ -18,8 +20,8 @@ This implementation intentionally excludes automatic retrieval and use of public
 
 - `PRODUCT.md` owns observable behavior; `TECH.md` owns design and validation.
 - `CURRENT_STATE.md` is the as-is reference; retain it as historical baseline and update README to describe the new behavior.
-- Do not fan out probes to job-board endpoints, balance requests across egresses, or change egress after an HTTP response.
-- Direct fallback stays opt-in and is selected only before target traffic starts.
+- Do not fan out probes to job-board endpoints. Destination signals stop provider work; rotation is for transport failures and evictions, never a way to switch egress after a destination restriction.
+- Direct fallback stays opt-in and is selected only before target traffic starts; pool exhaustion stops the run instead of changing egress.
 - Keep the aggregate target request budget unchanged.
 - Do not add a source-waiting dispatch path.
 

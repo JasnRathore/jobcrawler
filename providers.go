@@ -143,11 +143,14 @@ type providerStopError struct {
 }
 
 func (e *providerStopError) Error() string {
-	if !e.retryAt.IsZero() {
-		return fmt.Sprintf("%s stopped after HTTP %d (%s); retry no earlier than %s",
-			e.provider, e.status, e.reason, e.retryAt.Format(time.RFC3339))
+	if e.status != 0 {
+		if !e.retryAt.IsZero() {
+			return fmt.Sprintf("%s stopped after HTTP %d (%s); retry no earlier than %s",
+				e.provider, e.status, e.reason, e.retryAt.Format(time.RFC3339))
+		}
+		return fmt.Sprintf("%s stopped after HTTP %d (%s)", e.provider, e.status, e.reason)
 	}
-	return fmt.Sprintf("%s stopped after HTTP %d (%s)", e.provider, e.status, e.reason)
+	return fmt.Sprintf("%s stopped: %s", e.provider, e.reason)
 }
 
 func (e *providerStopError) Unwrap() error { return errProviderStopped }
@@ -219,6 +222,16 @@ func destinationStopError(provider string, res *http.Response) *providerStopErro
 		retryAt:    retryAt,
 		reason:     reason,
 	}
+}
+
+// stopProviderForProxyExhaustion records a run-wide stop once every
+// supplied proxy route has been evicted, so failing proxies end the run
+// cleanly instead of marking every remaining candidate as failed.
+func stopProviderForProxyExhaustion(limiter *requestLimiter, provider string) *providerStopError {
+	return limiter.stopProvider(&providerStopError{
+		provider: provider,
+		reason:   "no healthy proxy route remains; rerun with --resume after refreshing the proxy list",
+	})
 }
 
 type jobBoardProvider interface {
@@ -339,6 +352,9 @@ func fetchProviderResponse(
 		for i, endpoint := range endpoints {
 			lease, leaseErr := acquireLease(ctx, pool, client)
 			if leaseErr != nil {
+				if errors.Is(leaseErr, errProxyExhausted) {
+					leaseErr = stopProviderForProxyExhaustion(limiter, name)
+				}
 				return providerHTTPResponse{}, leaseErr
 			}
 			if err := limiter.waitForProvider(ctx, name); err != nil {

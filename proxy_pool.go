@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,11 +47,12 @@ func (entry geonodeProxyEntry) toEntries() []proxyListEntry {
 	}
 	mapped := make([]proxyListEntry, 0, len(entry.Protocols))
 	for _, protocol := range entry.Protocols {
+		protocol = strings.ToLower(strings.TrimSpace(protocol))
 		if protocol != "http" && protocol != "socks5" {
 			continue
 		}
 		mapped = append(mapped, proxyListEntry{
-			Proxy:     protocol + "://" + entry.IP + ":" + entry.Port.String(),
+			Proxy:     protocol + "://" + net.JoinHostPort(entry.IP, entry.Port.String()),
 			Protocol:  protocol,
 			Alive:     true,
 			Anonymity: entry.Anonymity,
@@ -89,6 +91,9 @@ func decodeProxyList(data []byte) ([]proxyListEntry, error) {
 	readEntries := func(raw json.RawMessage) ([]proxyListEntry, bool) {
 		var candidate []proxyListEntry
 		if err := json.Unmarshal(raw, &candidate); err == nil {
+			if len(candidate) == 0 {
+				return candidate, true
+			}
 			for _, entry := range candidate {
 				if entry.Proxy != "" {
 					return candidate, true
@@ -173,10 +178,14 @@ type proxyPool struct {
 	mu      sync.Mutex
 	saveMu  sync.Mutex // serializes save() so flushes never race
 	peers   []*proxyPeer
-	pinned  *proxyPeer
-	healthy int
+	healthy int // non-evicted peers; healthyPeers mirrors it
 	cfg     proxyPoolConfig
 }
+
+// errProxyExhausted reports that every proxy route in the pool has been
+// evicted after repeated failures. Egress never silently falls back to a
+// direct connection; the caller stops the run instead.
+var errProxyExhausted = errors.New("every supplied proxy route has been evicted")
 
 type proxyOutcome int
 
@@ -277,9 +286,13 @@ func eligibleProxyEntries(entries []proxyListEntry, uniqueHosts bool) []proxyLis
 	return kept
 }
 
-// loadProxyPool reads a proxy list and pins the highest-ranked eligible
-// entry for the run. Route eligibility is determined from the supplied
-// list only; target endpoints are never contacted to probe proxy candidates.
+// loadProxyPool reads a proxy list (local file or http(s) URL) and keeps
+// every eligible entry as a leaseable route. Eligibility comes from the
+// supplied list only (alive, http or socks5, elite or blank anonymity,
+// unique proxy URL); target endpoints are never contacted to probe proxy
+// candidates. Peers keep their list order (best uptime first) so the
+// first requests try the highest-ranked routes, and requests then rotate
+// across every healthy route for the rest of the run.
 func loadProxyPool(
 	ctx context.Context,
 	source string,
@@ -306,16 +319,16 @@ func loadProxyPool(
 		return nil, fmt.Errorf("no eligible proxy entries in %s", source)
 	}
 
-	chosen := eligible[0]
-	proxyURL, err := url.Parse(chosen.Proxy)
-	if err != nil {
-		return nil, fmt.Errorf("parse selected proxy: %w", err)
+	peers := make([]*proxyPeer, 0, len(eligible))
+	for _, chosen := range eligible {
+		proxyURL, err := url.Parse(chosen.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy %s: %w", chosen.Proxy, err)
+		}
+		peers = append(peers, &proxyPeer{raw: chosen.Proxy, client: newPeerClient(proxyURL, requestTimeout)})
 	}
-	// A selected manual route stays fixed. Pool exhaustion is fail-closed;
-	// never change egress mid-run.
-	peer := &proxyPeer{raw: chosen.Proxy, client: newPeerClient(proxyURL, requestTimeout)}
-	log.Printf("selected one of %d eligible proxies from %s; route is pinned for this run", len(eligible), source)
-	return &proxyPool{peers: []*proxyPeer{peer}, pinned: peer, healthy: 1, cfg: cfg}, nil
+	log.Printf("loaded %d eligible proxies from %s; requests rotate across healthy routes", len(peers), source)
+	return &proxyPool{peers: peers, healthy: len(peers), cfg: cfg}, nil
 }
 
 // newPeerClient builds an HTTP client pinned to a single proxy URL. The
@@ -346,47 +359,65 @@ func newPeerClient(proxyURL *url.URL, timeout time.Duration) *http.Client {
 	}
 }
 
-// acquire leases the one pinned peer exclusively. It blocks until that
-// route is available or the context ends. It never rotates to another peer
-// or falls back to direct egress.
-func (p *proxyPool) acquire(ctx context.Context) (*proxyPeer, bool, error) {
+// acquire leases one healthy peer exclusively. Idle peers are handed out
+// least-recently-used first, so workers rotate across every supplied
+// route; per-peer cooldowns and the reuse gap are honored, a leased peer
+// is never double-booked, and acquisition blocks until a route is ready
+// or the context ends. Evicted routes are skipped, and once every route
+// has been evicted acquire fails closed with errProxyExhausted instead of
+// changing egress (for example to a direct connection).
+func (p *proxyPool) acquire(ctx context.Context) (*proxyPeer, error) {
 	for {
 		p.mu.Lock()
-		if p.pinned == nil {
-			for _, peer := range p.peers {
-				if !peer.evicted {
-					p.pinned = peer
-					break
-				}
-			}
-		}
-		peer := p.pinned
-		if peer == nil || peer.evicted {
+		if p.healthy == 0 {
 			p.mu.Unlock()
-			return nil, false, errors.New("pinned proxy route is unavailable; refusing to change egress")
+			return nil, errProxyExhausted
 		}
 		now := time.Now()
-		if !peer.inUse {
+		var (
+			best      *proxyPeer
+			anyLeased bool
+			nextWait  time.Duration
+			hasWait   bool
+		)
+		for _, peer := range p.peers {
+			if peer.evicted {
+				continue
+			}
+			if peer.inUse {
+				anyLeased = true
+				continue
+			}
 			ready := peer.lastUsed.Add(p.cfg.minReuseGap)
 			if peer.cooldownUntil.After(ready) {
 				ready = peer.cooldownUntil
 			}
-			wait := ready.Sub(now)
-			if wait <= 0 {
-				peer.inUse = true
-				p.mu.Unlock()
-				return peer, false, nil
+			if wait := ready.Sub(now); wait > 0 {
+				if !hasWait || wait < nextWait {
+					nextWait, hasWait = wait, true
+				}
+				continue
 			}
+			if best == nil || peer.lastUsed.Before(best.lastUsed) {
+				best = peer
+			}
+		}
+		if best != nil {
+			best.inUse = true
 			p.mu.Unlock()
-			if err := waitContext(ctx, wait); err != nil {
-				return nil, false, err
-			}
-			continue
+			return best, nil
+		}
+		// Every remaining peer is leased or cooling down. Poll quickly
+		// when a lease may come back; otherwise sleep until the earliest
+		// cooldown or reuse gap expires.
+		wait := proxyInUsePollInterval
+		if !anyLeased && hasWait {
+			wait = nextWait
 		}
 		p.mu.Unlock()
 
-		if err := waitContext(ctx, proxyInUsePollInterval); err != nil {
-			return nil, false, err
+		if err := waitContext(ctx, wait); err != nil {
+			return nil, err
 		}
 	}
 }
@@ -443,7 +474,7 @@ func (p *proxyPool) release(peer *proxyPeer, outcome proxyOutcome, retryAfter ti
 	if outcome != proxyOutcomeRateLimited && !peer.evicted && p.cfg.maxFailures > 0 && peer.failures >= p.cfg.maxFailures {
 		peer.evicted = true
 		p.healthy--
-		log.Printf("proxy %s evicted after %d consecutive failures (%d healthy left)",
+		log.Printf("proxy %s evicted after %d consecutive failures (%d healthy routes left)",
 			peer.raw, peer.failures, p.healthy)
 		peer.client.CloseIdleConnections()
 	}
@@ -698,12 +729,9 @@ func acquireLease(ctx context.Context, pool *proxyPool, client *http.Client) (re
 	if pool == nil {
 		return requestLease{client: client}, nil
 	}
-	peer, direct, err := pool.acquire(ctx)
+	peer, err := pool.acquire(ctx)
 	if err != nil {
 		return requestLease{}, err
-	}
-	if direct {
-		return requestLease{client: client}, nil
 	}
 	return requestLease{pool: pool, peer: peer, client: peer.client}, nil
 }

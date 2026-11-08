@@ -16,8 +16,9 @@ the same in-run set suppresses duplicates. Only brute-only runs using
 `--resume` have a persistent brute-force checkpoint.
 
 The process-wide `--rps` limiter still applies to every target request and
-retry. A retry of a transient transport or server error uses the same route
-and consumes another limiter token.
+retry. A retry of a transient transport or server error consumes another
+limiter token and reacquires a lease, so it may rotate to another healthy
+proxy route (direct mode retries use the direct client).
 
 ## Destination stop policy
 
@@ -37,52 +38,83 @@ signal is shared across workers and job-update tasks for the run.
 
 `--proxies` accepts a local JSON list or an explicitly supplied HTTP(S) list
 URL. The loader filters for entries marked alive with supported HTTP or
-SOCKS5 protocols and acceptable anonymity metadata, deduplicates them, then
-selects the highest source-reported uptime entry (stable input order breaks
-ties). That single route is pinned for the run; source claims are not a
-transport-health guarantee.
+SOCKS5 protocols and acceptable anonymity metadata, deduplicates them, and
+keeps every eligible entry as a leaseable route (stable order, best
+source-reported uptime first). Source claims are not a transport-health
+guarantee; the loader does not probe candidates against job-board endpoints.
 
-The loader does not probe candidates against job-board endpoints. The pinned
-route is not replaced after transport failures or HTTP responses. If it is
-evicted after repeated failures, the run fails closed. `--proxies off`
-selects the configured direct client before the run; the client may still use
-the process's `HTTP_PROXY`/`HTTPS_PROXY` environment settings.
+Routes are leased exclusively, one request at a time, and handed out
+least-recently-used first, so discovery and job updates rotate across the
+whole list. Each route carries its own state:
 
-The pool retains exclusive leases and `--proxy-reuse-min`, so requests
-through a single proxy are serialized. `--proxy-failures` controls when the
-pinned entry is evicted. `--proxy-save` atomically writes that entry and its
-observed run statistics. It does not claim that a saved proxy is verified
-for future use.
+- A transport error or 5xx response marks the route failed; the bounded
+  retry loop then reacquires a lease, which rotates the retry to another
+  healthy route.
+- A 429 response sets the route's cooldown from its `Retry-After` (floored
+  at one second, capped by `--cooldown`) so other routes serve while it
+  recovers; the provider-wide stop policy below still applies.
+- `--proxy-reuse-min` enforces a per-route gap before a route may handle
+  another request.
+- `--proxy-failures` consecutive failed outcomes evict a route; evicted
+  routes are skipped and workers keep rotating through survivors, with
+  pool health logged in the brute-force progress line.
+
+Exhaustion and egress policy: when every route has been evicted, requests
+stop with `errProxyExhausted`, which is recorded as a provider stop for the
+run (cleanly ending work, preserving checkpoints and resumability) rather
+than falling back to direct egress. `--proxies off` selects the configured
+direct client before the run; the client may still use the process's
+`HTTP_PROXY`/`HTTPS_PROXY` environment settings.
 
 `--allow-direct-fallback` is rejected. Direct routing must be selected before
-the run with `--proxies off`; a proxy failure never changes egress. The
-legacy `--collect-proxies` option is also rejected because its former
-behavior probed candidates against provider endpoints. Automatic public
-source gathering and use in word-list or brute-force discovery are not
-implemented.
+the run with `--proxies off`; rotation stays inside the routes the user
+supplied. The legacy `--collect-proxies` option is also rejected because its
+former behavior probed candidates against provider endpoints. Automatic public
+source gathering is available through `crawler proxy refresh`, which fetches
+the HProxy, Proxifly, ProxyScrape, and Geonode lists concurrently and
+normalizes their JSON and text formats for review. It reports per-source
+failures and retains successful results, writing one JSON object with a
+`retrievedAt` timestamp, per-source `sources` report, and the `proxies`
+array to stdout — or to an explicit file with `-o FILE` (same JSON, atomic
+temp-file rename; `-o -` selects stdout). The documented reuse path is
+reviewing that file and passing it to `--proxies` (with `--proxy-save`
+writing surviving routes and their observed statistics back in the same
+shape). A destination rate limit still stops provider work.
 
-## Legacy flags
+`proxy filter` live-checks a gathered or supplied list with real
+connection attempts through each candidate's own CONNECT tunnel against
+a neutral connectivity endpoint (never a job-board destination), and
+writes survivors — best proven first, with measured attempt statistics —
+plus an optional review file of dead candidates marked `alive: false`,
+to files that `--proxies` can load directly.
 
-| Flag | Current behavior |
+## Proxy controls and legacy flags
+
+| Option or command | Current behavior |
 |---|---|
-| `--proxies` | Optional manual list; selects one eligible route and pins it |
-| `--proxy-reuse-min` | Minimum delay before the pinned route can be reused |
-| `--proxy-failures` | Consecutive failures before the pinned route is evicted |
-| `--proxy-save` | Save the selected route and observed run statistics |
+| `--proxies` | Manual list; every eligible entry rotates as a leaseable route |
+| `--proxy-reuse-min` | Minimum delay before one route may be reused (per route) |
+| `--proxy-failures` | Consecutive failures before a route is evicted from rotation |
+| `--proxy-save` | Save surviving routes and observed run statistics for reuse |
+| `proxy refresh` | Fetch and normalize four public sources; output for review, not auto-routing |
+| `proxy filter` | Live-check a list against a neutral endpoint; write proven routes best-first, dead candidates marked not alive |
 | `--proxy-probe-timeout` | Deprecated; no proxy health probes run |
 | `--allow-direct-fallback` | Deprecated and rejected; select direct mode before the run |
 | `--collect-proxies` | Disabled and rejected; no job-board probe collection |
 | `--proxy-sources`, `--collect-iterations`, `--collect-unique-hosts` | Deprecated legacy collection flags |
-| `--cooldown` | Deprecated; destination restriction responses stop provider work |
+| `--cooldown` | Deprecated; caps per-route 429 cooldowns from `Retry-After` |
 | `--rps` | Aggregate target request rate cap, shared across workers and retries |
 
 ## Testing
 
-Tests use local fake transports and databases. Proxy tests cover deterministic
-single-route selection, no destination probe fanout, pinned-route behavior,
-fail-closed eviction, and the absence of rotation after 429 or transport
-failures. Provider and job-update tests cover shared stop signals and
-`Retry-After`; brute-force tests verify that a destination stop is not retried
-or checkpointed past unfinished candidates. CLI tests cover Cobra root
-compatibility, fresh options per invocation, and the disabled legacy
-collection option.
+Tests use local fake transports and databases. Proxy tests cover loading
+every eligible route without destination probes, exclusive leases with
+least-recently-used rotation, per-route reuse gaps and 429 cooldowns,
+eviction plus worker reroute to survivors, exhaustion failing closed with a
+provider stop, and refresh output feeding the pool directly. Source-refresh
+tests cover filtering, HTTPS fetching, redirect rejection, and the absence
+of candidate probes. Provider and job-update tests cover shared stop
+signals and `Retry-After`; brute-force tests verify that a destination stop
+is not retried or checkpointed past unfinished candidates. CLI tests cover
+Cobra root compatibility, fresh options per invocation, and the disabled
+legacy collection option.
