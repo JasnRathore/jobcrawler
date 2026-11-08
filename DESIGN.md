@@ -22,13 +22,27 @@ proxy route (direct mode retries use the direct client).
 
 ## Destination stop policy
 
-Provider responses are checked for destination rate limits and access-control
-signals. HTTP 429, 401, 403, 407, 406, 451, and recognized challenge or block
-headers stop new work for that provider in the current run. A 429's
-`Retry-After` is reported as a recommendation for a later run; it does not
-cause an automatic wait-and-retry. Queued work is discarded, in-flight work
-is canceled when possible, and brute-force checkpoints are not advanced past
-unfinished candidates.
+Provider responses are checked for destination rate limits and
+access-control signals. A `429` is congestion, not a block: it cools the
+route that received it (from `Retry-After`, floored at one second and
+capped by `--cooldown`) and the request retries on another healthy route,
+so a rate limit never stops the run by itself. On Greenhouse, `403` and
+`406` are rate limiting expressed as blocks and follow the same rule.
+When rate-limit responses pile up across routes — at least 5 within a
+minute — the provider instead pauses briefly (the longest observed
+`Retry-After`, at most `--cooldown`) with its burst clamped, so the pool
+breathes rather than strip-mining every route against a destination that
+is signaling congestion, and then resumes normally.
+
+HTTP 401, 407, 451 — and `403`/`406` from other providers — plus
+recognized challenge or block headers are access-control signals: they
+stop new work for that provider in the current run, and rotation never
+treats them as route failures to bypass. Queued work is discarded,
+in-flight work is canceled when possible, and brute-force checkpoints
+are not advanced past unfinished candidates. Bad requests and other
+unexpected statuses are per-candidate failures: they retry across routes
+within the bounded attempt count, and exhausted candidates are recorded
+in `failed.txt` without stopping the run.
 
 Other transient transport failures and 5xx responses may be retried within
 the existing bounded attempt count, but never by changing egress. A stop
@@ -52,7 +66,8 @@ whole list. Each route carries its own state:
   healthy route.
 - A 429 response sets the route's cooldown from its `Retry-After` (floored
   at one second, capped by `--cooldown`) so other routes serve while it
-  recovers; the provider-wide stop policy below still applies.
+  recovers; the limiter counts `429`s across routes in a one-minute
+  window and pauses the provider briefly once 5 pile up, then resumes.
 - `--proxy-reuse-min` enforces a per-route gap before a route may handle
   another request.
 - `--proxy-failures` consecutive failed outcomes evict a route; evicted
@@ -102,7 +117,7 @@ to files that `--proxies` can load directly.
 | `--allow-direct-fallback` | Deprecated and rejected; select direct mode before the run |
 | `--collect-proxies` | Disabled and rejected; no job-board probe collection |
 | `--proxy-sources`, `--collect-iterations`, `--collect-unique-hosts` | Deprecated legacy collection flags |
-| `--cooldown` | Deprecated; caps per-route 429 cooldowns from `Retry-After` |
+| `--cooldown` | Caps per-route cooling and the provider pause after repeated `429`s |
 | `--rps` | Aggregate target request rate cap, shared across workers and retries |
 
 ## Testing

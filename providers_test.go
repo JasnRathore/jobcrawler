@@ -275,8 +275,8 @@ func providerResponse(req *http.Request, status int, body string) *http.Response
 	}
 }
 
-func TestGreenhouseAccessControlStatusesStopWithoutRetry(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseUnauthorizedStopsWithoutRetry(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			requests := 0
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -302,34 +302,38 @@ func TestGreenhouseAccessControlStatusesStopWithoutRetry(t *testing.T) {
 	}
 }
 
-func TestGreenhouse429RetriesWithoutStopping(t *testing.T) {
-	requests := 0
-	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		requests++
-		return providerResponse(req, http.StatusTooManyRequests, ""), nil
-	})}
-	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
+func TestGreenhouseRateLimitsRetryWithoutStopping(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusNotAcceptable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			requests := 0
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				return providerResponse(req, status, ""), nil
+			})}
+			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
 
-	found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
-	if found {
-		t.Fatal("Greenhouse company was found after rate limit responses")
-	}
-	if errors.Is(err, errProviderStopped) {
-		t.Fatalf("check error = %v, want rate-limit retry failure, not a provider stop", err)
-	}
-	if !strings.Contains(err.Error(), "rate limited") {
-		t.Fatalf("check error = %v, want it to mention rate limiting", err)
-	}
-	if requests != 4 {
-		t.Fatalf("made %d requests, want 4 bounded attempts", requests)
-	}
-	if limiter.providerStop(providerGreenhouse) != nil {
-		t.Fatal("provider-wide stop was recorded for a 429")
-	}
-	// Four hits stay below the cross-route breaker tolerance (5):
-	// rotation handles them, no global pause yet.
-	if !limiter.cooldownUntil.IsZero() {
-		t.Fatal("four 429s tripped the global pause, want rotation instead")
+			found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+			if found {
+				t.Fatalf("Greenhouse company was found after HTTP %d responses", status)
+			}
+			if errors.Is(err, errProviderStopped) {
+				t.Fatalf("check error = %v, want rate-limit retry failure, not a provider stop", err)
+			}
+			if !strings.Contains(err.Error(), "rate limited") {
+				t.Fatalf("check error = %v, want it to mention rate limiting", err)
+			}
+			if requests != 4 {
+				t.Fatalf("made %d requests, want 4 bounded attempts", requests)
+			}
+			if limiter.providerStop(providerGreenhouse) != nil {
+				t.Fatal("provider-wide stop was recorded for a rate limit")
+			}
+			// Four hits stay below the cross-route breaker tolerance (5):
+			// rotation handles them, no global pause yet.
+			if !limiter.cooldownUntil.IsZero() {
+				t.Fatal("four rate limits tripped the global pause, want rotation instead")
+			}
+		})
 	}
 }
 
@@ -443,6 +447,32 @@ func TestProviderStopErrorReportsFixedRetryTime(t *testing.T) {
 
 	if got := stop.Error(); !strings.Contains(got, retryAt.Format(time.RFC3339)) {
 		t.Fatalf("provider stop error = %q, want fixed retry time %s", got, retryAt.Format(time.RFC3339))
+	}
+}
+
+func TestGreenhouseBadStatusRetriesThenFailsIntoFailed(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return providerResponse(req, http.StatusBadRequest, ""), nil
+	})}
+	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
+
+	found, err := (greenhouseProvider{}).CheckCompany(context.Background(), client, nil, limiter, "example", nil)
+	if found {
+		t.Fatal("Greenhouse company was found after bad-request responses")
+	}
+	if errors.Is(err, errProviderStopped) {
+		t.Fatalf("check error = %v, want a per-candidate failure that lands in failed.txt, not a stop", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "status 400") {
+		t.Fatalf("check error = %v, want it to report the exhausted bad status", err)
+	}
+	if requests != 4 {
+		t.Fatalf("made %d requests, want 4 bounded attempts across routes before failing", requests)
+	}
+	if limiter.providerStop(providerGreenhouse) != nil {
+		t.Fatal("provider-wide stop was recorded for bad requests")
 	}
 }
 

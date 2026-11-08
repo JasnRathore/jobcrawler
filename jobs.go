@@ -420,12 +420,14 @@ func fetchGreenhouseJobs(
 			lease.release(proxyOutcomeFailed, 0)
 			lastFailure = fmt.Sprintf("transport error: %v", err)
 		} else {
-			if res.StatusCode == http.StatusTooManyRequests {
+			if res.StatusCode == http.StatusTooManyRequests || res.StatusCode == http.StatusForbidden || res.StatusCode == http.StatusNotAcceptable {
+				// On Greenhouse 403/406 are rate limiting expressed as
+				// blocks: cool this route and retry on another one.
 				res.Body.Close()
 				retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 				lease.release(proxyOutcomeRateLimited, retryAfter)
 				limiter.recordRateLimit(providerGreenhouse, retryAfter)
-				lastFailure = "rate limited (HTTP 429)"
+				lastFailure = fmt.Sprintf("rate limited (HTTP %d)", res.StatusCode)
 			} else if isDestinationStopResponse(res) {
 				res.Body.Close()
 				stop := destinationStopError(providerGreenhouse, res)

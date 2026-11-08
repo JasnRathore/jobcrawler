@@ -20,7 +20,7 @@ This implementation intentionally excludes automatic retrieval and use of public
 
 - `PRODUCT.md` owns observable behavior; `TECH.md` owns design and validation.
 - `CURRENT_STATE.md` is the as-is reference; retain it as historical baseline and update README to describe the new behavior.
-- Do not fan out probes to job-board endpoints. Destination signals stop provider work; rotation is for transport failures and evictions, never a way to switch egress after a destination restriction.
+- Do not fan out probes to job-board endpoints. A `429` cools its route and rotates (pausing the provider briefly when many routes hit it); access-control signals stop provider work; rotation is for transport failures and evictions, never a way to switch egress after an access-control restriction.
 - Direct fallback stays opt-in and is selected only before target traffic starts; pool exhaustion stops the run instead of changing egress.
 - Keep the aggregate target request budget unchanged.
 - Do not add a source-waiting dispatch path.
@@ -29,5 +29,5 @@ This implementation intentionally excludes automatic retrieval and use of public
 
 1. Cobra root and existing CLI invocations remain testable.
 2. Manual proxy input does not trigger destination probes or egress failover.
-3. Destination rate-limit/access-control responses stop provider work.
+3. Destination access-control responses stop provider work; rate limits rotate with a provider pause.
 4. Run focused tests, then `go test ./...` and `go vet ./...`.

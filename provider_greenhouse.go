@@ -79,11 +79,13 @@ func (greenhouseProvider) CheckCompany(
 		case status == http.StatusNotFound:
 			lease.release(proxyOutcomeOK, 0)
 			return false, nil
-		case status == http.StatusTooManyRequests:
+		case status == http.StatusTooManyRequests || status == http.StatusForbidden || status == http.StatusNotAcceptable:
+			// On Greenhouse 403/406 are rate limiting expressed as
+			// blocks: cool this route and retry on another one.
 			retryAfter := parseRetryAfter(res.Header.Get("Retry-After"), time.Now())
 			lease.release(proxyOutcomeRateLimited, retryAfter)
 			limiter.recordRateLimit(providerGreenhouse, retryAfter)
-			lastFailure = "rate limited (HTTP 429)"
+			lastFailure = fmt.Sprintf("rate limited (HTTP %d)", status)
 		case isDestinationStopResponse(res):
 			stop := destinationStopError(providerGreenhouse, res)
 			lease.release(proxyOutcomeFailed, 0)
@@ -92,8 +94,11 @@ func (greenhouseProvider) CheckCompany(
 			lease.release(proxyOutcomeFailed, 0)
 			lastFailure = fmt.Sprintf("status %d", status)
 		default:
+			// Bad requests and other unexpected statuses are per-candidate
+			// failures: retry on other routes, then let the candidate fail
+			// into failed.txt without stopping the run.
 			lease.release(proxyOutcomeFailed, 0)
-			return false, fmt.Errorf("unexpected status %d", status)
+			lastFailure = fmt.Sprintf("status %d", status)
 		}
 		if attempt == 3 {
 			return false, fmt.Errorf("gave up checking Greenhouse company after retries (last: %s)", lastFailure)

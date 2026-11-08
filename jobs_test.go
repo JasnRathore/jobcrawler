@@ -356,8 +356,8 @@ func TestBookmarkButtonTemplateReflectsSavedState(t *testing.T) {
 	}
 }
 
-func TestGreenhouseFetchJobsStopsOn403406(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseFetchJobsUnauthorizedStops(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			requests := 0
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -387,33 +387,37 @@ func TestGreenhouseFetchJobsStopsOn403406(t *testing.T) {
 	}
 }
 
-func TestGreenhouseFetchJobs429RetriesWithoutStopping(t *testing.T) {
-	requests := 0
-	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		requests++
-		return &http.Response{
-			StatusCode: http.StatusTooManyRequests,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("")),
-			Request:    req,
-		}, nil
-	})}
-	limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
-	jobs, err := (greenhouseProvider{}).FetchJobs(context.Background(), client, nil, limiter, "example")
-	if errors.Is(err, errProviderStopped) {
-		t.Fatalf("fetch error = %v, want rate-limit retry failure, not a provider stop", err)
-	}
-	if !strings.Contains(err.Error(), "rate limited") {
-		t.Fatalf("fetch error = %v, want it to mention rate limiting", err)
-	}
-	if len(jobs) != 0 {
-		t.Fatalf("unexpected jobs after rate limit responses: %+v", jobs)
-	}
-	if requests != 4 {
-		t.Fatalf("made %d requests, want 4 bounded attempts", requests)
-	}
-	if limiter.providerStop(providerGreenhouse) != nil {
-		t.Fatal("provider-wide stop was recorded for a 429")
+func TestGreenhouseFetchJobsRateLimitsRetryWithoutStopping(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusNotAcceptable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			requests := 0
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				return &http.Response{
+					StatusCode: status,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			})}
+			limiter := newRequestLimiter(rate.NewLimiter(rate.Inf, 1), 0)
+			jobs, err := (greenhouseProvider{}).FetchJobs(context.Background(), client, nil, limiter, "example")
+			if errors.Is(err, errProviderStopped) {
+				t.Fatalf("fetch error = %v, want rate-limit retry failure, not a provider stop", err)
+			}
+			if !strings.Contains(err.Error(), "rate limited") {
+				t.Fatalf("fetch error = %v, want it to mention rate limiting", err)
+			}
+			if len(jobs) != 0 {
+				t.Fatalf("unexpected jobs after rate limit responses: %+v", jobs)
+			}
+			if requests != 4 {
+				t.Fatalf("made %d requests, want 4 bounded attempts", requests)
+			}
+			if limiter.providerStop(providerGreenhouse) != nil {
+				t.Fatal("provider-wide stop was recorded for a rate limit")
+			}
+		})
 	}
 }
 

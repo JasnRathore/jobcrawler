@@ -1001,8 +1001,8 @@ func (p rotationTestProvider) FetchJobs(
 	return []db.Job{}, nil
 }
 
-func TestGreenhouseStopsProviderOnAccessControl(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseStopsProviderOnUnauthorized(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var restrictedHits, alternateHits int
 			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1042,8 +1042,8 @@ func TestGreenhouseStopsProviderOnAccessControl(t *testing.T) {
 	}
 }
 
-func TestGreenhouseFetchJobsStopsOnAccessControl(t *testing.T) {
-	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+func TestGreenhouseFetchJobsStopsOnUnauthorized(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var restrictedHits, alternateHits int
 			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1083,3 +1083,91 @@ func TestGreenhouseFetchJobsStopsOnAccessControl(t *testing.T) {
 		})
 	}
 }
+
+func TestGreenhouseCheckRotatesOn403406(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var restrictedHits, alternateHits int
+			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				restrictedHits++
+				return &http.Response{
+					StatusCode: status,
+					Header:     http.Header{"Retry-After": []string{"2"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			})}}
+			healthyPeer := &proxyPeer{raw: "http://healthy:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				alternateHits++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			})}}
+			pool := &proxyPool{
+				peers:   []*proxyPeer{limitedPeer, healthyPeer},
+				healthy: 2,
+				cfg:     freeConfig(),
+			}
+			limiter := testLimiter()
+			found, err := (greenhouseProvider{}).CheckCompany(context.Background(), &http.Client{}, pool, limiter, "example", nil)
+			if err != nil || !found {
+				t.Fatalf("found=%t err=%v; want the check to rotate onto the healthy route", found, err)
+			}
+			if restrictedHits != 1 || alternateHits != 1 {
+				t.Fatalf("restricted requests=%d alternate requests=%d, want 1 and 1", restrictedHits, alternateHits)
+			}
+			if limiter.providerStop(providerGreenhouse) != nil {
+				t.Fatal("provider-wide stop was recorded for a Greenhouse rate limit")
+			}
+			if limitedPeer.failures != 1 || time.Until(limitedPeer.cooldownUntil) <= 0 {
+				t.Fatalf("limited peer failures=%d cooldown=%s, want 1 failure and a cooling route",
+					limitedPeer.failures, time.Until(limitedPeer.cooldownUntil))
+			}
+		})
+	}
+}
+
+func TestGreenhouseFetchJobsRotatesOn403406(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusNotAcceptable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var restrictedHits, alternateHits int
+			limitedPeer := &proxyPeer{raw: "http://limited:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				restrictedHits++
+				return &http.Response{
+					StatusCode: status,
+					Header:     http.Header{"Retry-After": []string{"2"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			})}}
+			healthyPeer := &proxyPeer{raw: "http://healthy:80", client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				alternateHits++
+				body := `{"jobs":[{"id":456,"title":"Backend Dev"}],"meta":{"total":1}}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Request:    req,
+				}, nil
+			})}}
+			pool := &proxyPool{
+				peers:   []*proxyPeer{limitedPeer, healthyPeer},
+				healthy: 2,
+				cfg:     freeConfig(),
+			}
+			limiter := testLimiter()
+			jobs, err := (greenhouseProvider{}).FetchJobs(context.Background(), &http.Client{}, pool, limiter, "example")
+			if err != nil || len(jobs) == 0 {
+				t.Fatalf("jobs=%+v err=%v; want the fetch to rotate onto the healthy route", jobs, err)
+			}
+			if restrictedHits != 1 || alternateHits != 1 {
+				t.Fatalf("restricted requests=%d alternate requests=%d, want 1 and 1", restrictedHits, alternateHits)
+			}
+			if limiter.providerStop(providerGreenhouse) != nil {
+				t.Fatal("provider-wide stop was recorded for a Greenhouse rate limit")
+			}
+		})
+	}
+}
+

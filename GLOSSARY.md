@@ -38,7 +38,7 @@ An eligible proxy through which an ordinary authorized request has completed suc
 A direct or proxy egress usable for target requests during a run. With a supplied proxy list, every healthy entry becomes a route and workers lease routes exclusively, rotating least-recently-used first; a route that keeps failing is evicted, and exhaustion stops the run instead of changing egress to direct.
 
 **Rotation**:
-Handing out pool routes to workers so successive requests use different healthy proxies. Failed requests rotate the retry to another route; destination signals (429, 403, 406, challenges) are honored as provider responses and stop the provider for the run rather than switching egress to bypass them.
+Handing out pool routes to workers so successive requests use different healthy proxies. Failed requests rotate the retry to another route; a `429` (and, on Greenhouse, `403`/`406`) cools that route and rotates instead of stopping the run (repeated rate limits across routes pause the provider briefly), while access-control signals (`401`, `407`, `451`, challenges — and other providers' `403`/`406`) stop the provider for the run rather than switching egress to bypass them.
 
 **Proxy cache**:
 The local, time-bounded record of normalized candidates and their source/retrieval metadata.
@@ -53,4 +53,4 @@ The process-wide request-rate limit and bounded-attempt allowance for requests t
 The separate, bounded request/time/concurrency limits for refreshing proxy-source data.
 
 **Destination signal**:
-A `429`, `403`, `406`, challenge, or other explicit restriction from a job-board provider. It is handled across routes as a provider response, never as a proxy transport failure.
+A `429`, `403`, `406`, challenge, or other explicit restriction from a job-board provider. A `429` (and, on Greenhouse, `403`/`406`) is treated as per-route congestion — the route cools down and the request rotates to another route, with a brief provider pause when rate limits pile up across routes. Other access-control responses (`401`, `407`, `451`, challenges, and other providers' `403`/`406`) stop the provider for the run. None are treated as proxy transport failures.

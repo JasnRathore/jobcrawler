@@ -28,9 +28,10 @@ refreshes all companies already stored across all providers.
   Brute force, when explicitly enabled, enumerates lowercase alphabetic slugs
   within the requested length range.
 - Requests are bounded by the worker count, request rate, and per-request
-  timeout. A rate-limit, access-control, or recognized challenge response
-  stops discovery for that provider for the run; it does not switch egress or
-  continue brute force.
+  timeout. A rate limit cools the affected route and retries on another
+  healthy route (pausing the provider briefly when many routes hit it),
+  while an access-control or recognized challenge response stops discovery
+  for that provider for the run; neither switches egress to bypass it.
 - Only query providers and company boards you are authorized to access. Prefer
   a word list for known companies; keep brute-force ranges small.
 - Job refreshes fetch listings for saved companies and replace their current
@@ -221,10 +222,12 @@ companies from the original snapshot. Companies discovered after that snapshot
 are picked up by the next fresh run. Once the full run succeeds, recovery state
 is retired and a later invocation refreshes every company again.
 
-A rate-limit, access-control, or recognized challenge response stops the
-whole update run and cancels queued work. The command reports completed and
-pending counts and any valid `Retry-After` deadline. It does not automatically
-wait, retry the blocked request, or switch providers/proxies; rerun
+A rate limit cools the affected route and retries on another healthy
+route, pausing the provider briefly only when rate limits pile up across
+routes. An access-control or recognized challenge response stops the
+whole update run and cancels queued work. The command reports completed
+and pending counts and any valid `Retry-After` deadline. It does not
+automatically wait, retry the blocked request, or switch providers/proxies; rerun
 `--update --jobs` after the reported deadline. If two update processes target
 the same database, only one may own the active run. After an abrupt process
 exit, the lease can take up to 60 seconds to expire before another invocation
@@ -305,9 +308,21 @@ Every eligible entry becomes a route in the run's proxy pool:
   route that was used least recently, so requests spread across the whole
   list instead of pinning one proxy.
 - A `429` applies the destination's `Retry-After` as a per-route cooldown
-  (floored at one second, capped by `--cooldown`); requests move to other
-  healthy routes while it cools down. Destination `429`, `403`, `406`,
-  or recognized challenge responses still stop the provider for the run.
+  (floored at one second, capped by `--cooldown`); the request is retried
+  on another healthy route while the first one cools down, so a rate
+  limit never stops the run. On Greenhouse, `403`/`406` behave the same
+  (rate limiting expressed as blocks). When rate limits pile up across
+  many routes (at least 5 within a minute), the provider pauses briefly
+  — bounded by the longest observed `Retry-After`, at most `--cooldown` —
+  and then resumes with fewer simultaneous attempts, instead of
+  strip-mining the whole pool against a destination that is signaling
+  congestion.
+- Destination `401`, `407`, `451`, and recognized challenge responses
+  are access-control signals: they still stop the provider for the run,
+  and rotation never treats them as route failures to bypass. Other
+  providers' `403`/`406` also still stop. Bad requests and other
+  unexpected statuses retry across routes and, once exhausted, are
+  logged to `failed.txt` for later retry — the run keeps going.
 - Failures and destination policy are kept apart: transport errors and
   5xx responses mark the route failed and the immediate retry rotates to
   another route. `--proxy-reuse-min` enforces a per-route gap between
@@ -444,7 +459,7 @@ reference.
 | `--workers N` | `64` | Number of concurrent workers; must be at least `1` |
 | `--rps N` | `50` | Maximum request rate; must be greater than `0` |
 | `--timeout DURATION` | `10s` | Maximum duration of an individual HTTP request, including reading its response body; e.g. `30s` or `2m`; must be greater than `0` |
-| `--cooldown DURATION` | `2m` | Deprecated compatibility option; destination restriction responses stop provider work instead of retrying |
+| `--cooldown DURATION` | `2m` | Caps per-route `Retry-After` cooling and the provider pause after repeated rate limits; `401`/`407`/`451` and challenge responses still stop the provider |
 | `--proxies FILE\|URL` | `off` | Load every eligible entry as a route and rotate requests across them; `off` selects direct egress |
 | `--proxy-reuse-min DURATION` | `0s` | Minimum gap before one proxy may handle another request (applies per route) |
 | `--proxy-failures N` | `5` | Evict a proxy from the rotation after this many consecutive failed requests |
@@ -485,7 +500,7 @@ described above.
 | `choose only one provider flag` | Select exactly one of the five provider flags. |
 | No companies are found from a word list | Confirm the provider, spellings, generated slug variants, and `--min`/`--max` range. |
 | Brute force runs much longer than expected | Reduce the length range. Candidate count grows exponentially with each extra character. |
-| A job update stops after a destination response | The run is resumable and completed work is retained. Follow the destination's published access policy; if a `Retry-After` time is printed, wait until then before rerunning `--update --jobs`. |
+| A job update stops after a destination response | The run is resumable and completed work is retained. Rate limits rotate and pause briefly instead of stopping; `401`/`407`/`451`/challenge responses stop. Follow the destination's published access policy; if a `Retry-After` time is printed, wait until then before rerunning `--update --jobs`. |
 | `no eligible proxy entries` | Check the JSON structure, `alive`, `protocol`, and `anonymity` values. Proxy source metadata is not verified by probing targets. |
 | `no eligible proxy entries in FILE` | The list had entries, but none passed the eligibility filter; keep entries `alive`, `http`/`socks5`, and `elite` (or no anonymity value). |
 | `greenhouse stopped: no healthy proxy route remains` | All `--proxies` routes failed repeatedly and the run stopped instead of going direct; collect fresh lists with `crawler proxy refresh`, review the file, and rerun (add `--resume` to continue brute-force checkpoints). |

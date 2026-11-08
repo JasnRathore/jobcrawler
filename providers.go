@@ -155,8 +155,9 @@ func (l *requestLimiter) startCooldownDur(provider string, status int, dur time.
 	return wait
 }
 
-// recordRateLimit notes one HTTP 429 for the provider. The first few
-// rate limits within the window just cool their route while requests
+// recordRateLimit notes one rate limit for the provider (HTTP 429, or
+// Greenhouse 403/406, which are rate limiting expressed as blocks). The
+// first few rate limits within the window just cool their route while requests
 // rotate to other healthy proxies; once enough pile up within the window
 // the provider pauses briefly (bounded by --cooldown) so the whole pool
 // breathes instead of hammering the destination. Returns true when the
