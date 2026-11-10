@@ -40,8 +40,8 @@ type cliOptions struct {
 	resume              bool
 	update              bool
 	updateJobs          bool
-	browse              bool
-	browseAddress       string
+	dashboard           bool
+	dashboardAddress    string
 	workers             int
 	rps                 float64
 	requestTimeout      time.Duration
@@ -76,7 +76,7 @@ func newRootCommand() *cobra.Command {
 
 func newRootCommandWithRunner(runner func(*cliOptions, string) error) *cobra.Command {
 	opts := &cliOptions{
-		browseAddress:     "127.0.0.1:8080",
+		dashboardAddress:  "127.0.0.1:8080",
 		workers:           64,
 		rps:               50,
 		requestTimeout:    10 * time.Second,
@@ -95,7 +95,7 @@ func newRootCommandWithRunner(runner func(*cliOptions, string) error) *cobra.Com
 		Short: "Discover and update job-board data",
 		Long: `Crawler checks company slugs against applicant-tracking (ATS) providers,
 saves discovered boards to the local database, refreshes their job
-listings, and serves a browser for searching and bookmarking those jobs.
+listings, and serves a dashboard for searching and bookmarking those jobs.
 
 Pick exactly one provider with --greenhouse (default), --lever,
 --levereu, --workable, or --ashbyhq, and run one work mode at a time:
@@ -103,7 +103,7 @@ Pick exactly one provider with --greenhouse (default), --lever,
   --words FILE     check slugs generated from a company-name list
   --brute          check every lowercase slug in a length range
   --update --jobs  refresh stored listings for every known company
-  --browse         serve the local browser for indexed jobs
+  --dashboard      serve the local dashboard for indexed jobs
 
 Word-list candidates are checked before brute-force candidates, and both
 honor --workers, --rps, and --timeout. A rate limit (429, or Greenhouse
@@ -145,8 +145,8 @@ proxy-list format, and safety notes.`,
   # Refresh jobs for every discovered company across all providers
   crawler --update --jobs
 
-  # Browse and bookmark indexed jobs
-  crawler --browse`,
+  # Open the dashboard and bookmark indexed jobs
+  crawler --dashboard`,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -173,8 +173,10 @@ proxy-list format, and safety notes.`,
 	flags.BoolVar(&opts.resume, "resume", false, "resume or checkpoint brute-force progress (requires --brute)")
 	flags.BoolVar(&opts.update, "update", false, "update indexed data (always pair with --jobs)")
 	flags.BoolVar(&opts.updateJobs, "jobs", false, "fetch and refresh jobs for all known companies (requires --update)")
-	flags.BoolVar(&opts.browse, "browse", false, "launch the local job browser")
-	flags.StringVar(&opts.browseAddress, "addr", opts.browseAddress, "job browser listen address, for example 127.0.0.1:9090")
+	flags.BoolVar(&opts.dashboard, "dashboard", false, "launch the local job dashboard")
+	flags.BoolVar(&opts.dashboard, "browse", false, "deprecated alias for --dashboard")
+	flags.Lookup("browse").Deprecated = "use --dashboard"
+	flags.StringVar(&opts.dashboardAddress, "addr", opts.dashboardAddress, "dashboard listen address, for example 127.0.0.1:9090")
 	flags.IntVar(&opts.workers, "workers", opts.workers, "concurrent workers shared by all request modes")
 	flags.Float64Var(&opts.rps, "rps", opts.rps, "maximum aggregate requests per second across all workers")
 	flags.DurationVar(&opts.requestTimeout, "timeout", opts.requestTimeout, "per-request HTTP timeout (for example 10s or 1m)")
@@ -219,7 +221,7 @@ var cliHelpFlagGroups = []cliHelpFlagGroup{
 	{title: "Company discovery", names: []string{"words", "brute", "min", "max", "resume"}},
 	{title: "Request controls", names: []string{"workers", "rps", "timeout"}},
 	{title: "Manual proxy routing", names: []string{"proxies", "proxy-reuse-min", "proxy-failures", "proxy-save"}},
-	{title: "Other modes and browser", names: []string{"bench", "update", "jobs", "browse", "addr"}},
+	{title: "Other modes and dashboard", names: []string{"bench", "update", "jobs", "dashboard", "addr"}},
 	{title: "Legacy and disabled options", names: []string{
 		"cooldown", "proxy-probe-timeout", "allow-direct-fallback", "collect-proxies",
 		"proxy-sources", "collect-iterations", "collect-unique-hosts",
@@ -372,8 +374,8 @@ func validateCLIOptions(opts *cliOptions) (string, error) {
 		}
 		return "", fmt.Errorf("--words requires an explicit provider flag: %s", strings.Join(options, ", "))
 	}
-	if opts.resume && (!opts.brute || opts.bench || opts.words != "" || opts.browse || opts.update) {
-		return "", errors.New("--resume requires --brute and cannot be combined with --bench, --words, --browse, or --update")
+	if opts.resume && (!opts.brute || opts.bench || opts.words != "" || opts.dashboard || opts.update) {
+		return "", errors.New("--resume requires --brute and cannot be combined with --bench, --words, --dashboard, or --update")
 	}
 	if opts.update != opts.updateJobs {
 		return "", errors.New("--update and --jobs must be used together")
@@ -381,16 +383,16 @@ func validateCLIOptions(opts *cliOptions) (string, error) {
 	if opts.bench && opts.update {
 		return "", errors.New("--bench cannot be combined with --update or --jobs")
 	}
-	if opts.browse && (opts.bench || opts.update) {
-		return "", errors.New("--browse cannot be combined with --bench or --update")
+	if opts.dashboard && (opts.bench || opts.update) {
+		return "", errors.New("--dashboard cannot be combined with --bench or --update")
 	}
 	if opts.brute && maxSlugLength >= 6 {
 		log.Printf("warning: brute force up to length %d means %d candidates",
 			maxSlugLength, bruteCount(minSlugLength, maxSlugLength))
 	}
 	if opts.collectPath != "" {
-		if opts.brute || opts.words != "" || opts.bench || opts.update || opts.browse || opts.resume {
-			return "", errors.New("--collect-proxies cannot be combined with --brute, --words, --bench, --update/--jobs, --browse, or --resume")
+		if opts.brute || opts.words != "" || opts.bench || opts.update || opts.dashboard || opts.resume {
+			return "", errors.New("--collect-proxies cannot be combined with --brute, --words, --bench, --update/--jobs, --dashboard, or --resume")
 		}
 		if opts.collectIterations < 1 {
 			return "", errors.New("collect iterations must be at least 1")
@@ -410,8 +412,8 @@ func executeCLI(opts *cliOptions, provider string) (returnErr error) {
 	resume := &opts.resume
 	update := &opts.update
 	updateJobsFlag := &opts.updateJobs
-	browse := &opts.browse
-	browseAddress := &opts.browseAddress
+	dashboard := &opts.dashboard
+	dashboardAddress := &opts.dashboardAddress
 	workers := &opts.workers
 	rps := &opts.rps
 	requestTimeout := &opts.requestTimeout
@@ -488,13 +490,13 @@ func executeCLI(opts *cliOptions, provider string) (returnErr error) {
 	}
 	limiter := newRequestLimiter(rate.NewLimiter(rate.Limit(*rps), burst), *cooldown)
 	var proxies *proxyPool
-	if *browse {
-		// The browser serves local data; no remote requests, no pool needed.
+	if *dashboard {
+		// The dashboard serves local data; no remote requests, no pool needed.
 		if *proxiesPath != "off" {
-			log.Printf("--proxies has no effect with --browse")
+			log.Printf("--proxies has no effect with --dashboard")
 		}
 		if *proxySavePath != "" {
-			log.Printf("--proxy-save has no effect with --browse")
+			log.Printf("--proxy-save has no effect with --dashboard")
 		}
 	} else if *proxiesPath != "off" {
 		// Select one manual route without probing job-board endpoints. Its
@@ -527,8 +529,8 @@ func executeCLI(opts *cliOptions, provider string) (returnErr error) {
 	if *bench {
 		stats = newBenchmarkStats()
 	}
-	if *browse {
-		if err := serveJobBrowser(ctx, database, *browseAddress); err != nil {
+	if *dashboard {
+		if err := serveDashboard(ctx, database, *dashboardAddress); err != nil {
 			return err
 		}
 		return nil

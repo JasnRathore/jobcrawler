@@ -1,7 +1,7 @@
 # Job Board Crawler
 
 A command-line tool that discovers company job boards, indexes job listings from
-supported providers, and serves a local browser for searching and bookmarking
+supported providers, and serves a local dashboard for searching and bookmarking
 those listings.
 
 ## What the project does
@@ -13,7 +13,7 @@ The crawler has three main jobs:
 2. **Index job listings.** Refresh listings for companies already in the
    database and retain searchable fields such as title, location, dates, and
    application links.
-3. **Browse and save jobs.** Serve a local web interface over the indexed data
+3. **Dashboard and save jobs.** Serve a local web interface over the indexed data
    so you can search, filter, open original listings, and bookmark jobs.
 
 Supported discovery providers are Greenhouse, Lever, Lever EU, Workable, and
@@ -35,10 +35,10 @@ refreshes all companies already stored across all providers.
 - Only query providers and company boards you are authorized to access. Prefer
   a word list for known companies; keep brute-force ranges small.
 - Job refreshes fetch listings for saved companies and replace their current
-  indexed jobs. The local browser reads from the database and does not fetch
-  jobs from providers while you browse.
+  indexed jobs. The local dashboard reads from the database and does not fetch
+  jobs from providers while you use it.
 
-With no `--words`, `--brute`, `--update --jobs`, or `--browse` option, there is
+With no `--words`, `--brute`, `--update --jobs`, or `--dashboard` option, there is
 no candidate source or other work to perform. Pick a workflow below rather
 than expecting the default invocation to scan companies.
 
@@ -49,7 +49,8 @@ than expecting the default invocation to scan companies.
 | `main.go` | Cobra CLI, option validation, startup, discovery orchestration |
 | `providers.go`, `provider_*.go` | Shared provider behavior and provider-specific API adapters |
 | `bruteforce.go` | Concurrent candidate checks, failure output, and brute checkpoints |
-| `jobs.go` | Job fetching/updating and the local browser server |
+| `jobs.go` | Job fetching/updating and shared job parsing |
+| `dashboard.go` | Local job dashboard templates and HTTP handlers |
 | `proxy_pool.go` | Loading the supplied proxy list and rotating checks across healthy routes |
 | `proxy_refresh.go` | Gathering four public sources and normalizing their formats for review |
 | `proxy_filter.go` | Live-checking proxy lists against a neutral endpoint; keeping proven routes |
@@ -111,7 +112,7 @@ precedence over values in `.env`. Keep credentials private and do not commit
 
 The database contains provider-specific discovered companies, job records,
 bookmarks, and progress checkpoints. It is initialized and migrated on
-startup. The browser only listens on the configured address; by default that
+startup. The dashboard only listens on the configured address; by default that
 is loopback (`127.0.0.1:8080`).
 
 ## Quick start
@@ -138,8 +139,8 @@ go run . --update --jobs
 # Route a run through a rotating proxy pool from a list you collected
 go run . --greenhouse --words companies.txt --proxies proxies.json
 
-# Browse indexed jobs
-go run . --browse
+# Open the job dashboard
+go run . --dashboard
 ```
 
 By default, discovery uses Greenhouse. The provider flags select exactly one
@@ -233,26 +234,28 @@ the same database, only one may own the active run. After an abrupt process
 exit, the lease can take up to 60 seconds to expire before another invocation
 can resume it.
 
-## Browse jobs
+## Job dashboard
 
-Start the local browser:
+Start the local dashboard:
 
 ```powershell
-go run . --browse
+go run . --dashboard
 ```
 
-Open [http://127.0.0.1:8080](http://127.0.0.1:8080). The browser searches jobs
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). The dashboard searches jobs
 across providers and supports:
 
 - Search by job title, company, and location; optionally include descriptions
 - Filter by location, posting date range, employment type, and workplace type
 - Save jobs and switch between all jobs and saved jobs
+- Select a role to view its description and properties in the dashboard panes
 - Open the original listing and application links
 
-To listen on another address or port, use `--addr`:
+To listen on another address or port, use `--addr`. The previous `--browse`
+flag remains available as a deprecated alias for `--dashboard`:
 
 ```powershell
-go run . --browse --addr 127.0.0.1:9090
+go run . --dashboard --addr 127.0.0.1:9090
 ```
 
 ## Benchmark requests
@@ -268,7 +271,7 @@ go run . --bench --ashbyhq --words companies.txt
 
 Benchmark mode uses a temporary database and prints request, retry, status,
 latency, and company-check statistics when the run finishes. It cannot be
-combined with `--update`/`--jobs`, `--browse`, or `--resume`.
+combined with `--update`/`--jobs`, `--dashboard`, or `--resume`.
 
 ## Proxy lists and rotation
 
@@ -334,7 +337,7 @@ Every eligible entry becomes a route in the run's proxy pool:
 - If every route is evicted, the run stops for that provider (fail
   closed) instead of silently falling back to your direct connection.
   `--proxies off` selects direct egress before the run starts, and
-  `--browse` only reads database content and never uses a proxy.
+  `--dashboard` only reads database content and never uses a proxy.
 
 `proxy refresh` gathers lists from the four built-in public sources in
 parallel and normalizes them for review; `proxy filter` live-checks a
@@ -472,14 +475,15 @@ reference.
 | `--allow-direct-fallback` | Off | Disabled; select direct mode before the run with `--proxies off` |
 | `--bench` | Off | Benchmark discovery without changing `local.db` |
 | `--update --jobs` | Off | Refresh indexed jobs for every discovered company |
-| `--browse` | Off | Start the local job browser |
-| `--addr ADDRESS` | `127.0.0.1:8080` | Browser listen address |
+| `--dashboard` | Off | Start the local job dashboard |
+| `--browse` | Off | Deprecated alias for `--dashboard` |
+| `--addr ADDRESS` | `127.0.0.1:8080` | Dashboard listen address |
 
 Only one provider flag may be selected. If none is provided, Greenhouse is
 used for brute-force discovery. `--words` requires an explicit provider even
 though Greenhouse is the default for other discovery modes. `--update` and
 `--jobs` must be used together. Benchmark mode writes to a temporary database
-and cannot be combined with update, browsing, or resume.
+and cannot be combined with update, the dashboard, or resume.
 
 ## Data and recovery
 
@@ -505,7 +509,7 @@ described above.
 | `no eligible proxy entries in FILE` | The list had entries, but none passed the eligibility filter; keep entries `alive`, `http`/`socks5`, and `elite` (or no anonymity value). |
 | `greenhouse stopped: no healthy proxy route remains` | All `--proxies` routes failed repeatedly and the run stopped instead of going direct; collect fresh lists with `crawler proxy refresh`, review the file, and rerun (add `--resume` to continue brute-force checkpoints). |
 | Remote database configuration fails | Set `DB_MODE=remote`, `TURSO_DATABASE_URL`, and `TURSO_AUTH_TOKEN`; environment values override `.env`. |
-| Browser address is already in use | Choose another local port, for example `--browse --addr 127.0.0.1:9090`. |
+| Dashboard address is already in use | Choose another local port, for example `--dashboard --addr 127.0.0.1:9090`. |
 
 ## Development
 

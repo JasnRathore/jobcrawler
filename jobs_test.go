@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -194,7 +195,7 @@ func TestListJobsSearchesTitlesByDefault(t *testing.T) {
 
 }
 
-func TestJobsBrowseAcrossProvidersAndApplyCommonFilters(t *testing.T) {
+func TestDashboardJobsAcrossProvidersAndCommonFilters(t *testing.T) {
 	ctx := context.Background()
 	database, err := db.New(ctx, filepath.Join(t.TempDir(), "combined.db"))
 	if err != nil {
@@ -323,36 +324,197 @@ func TestBookmarksPersistWhenJobsAreRemoved(t *testing.T) {
 	}
 }
 
-func TestBookmarkButtonTemplateReflectsSavedState(t *testing.T) {
+func TestDashboardTemplateRendersWorkspace(t *testing.T) {
+	var rendered bytes.Buffer
+	if err := dashboardPageTemplate.Execute(&rendered, dashboardHome{BookmarkCount: 3}); err != nil {
+		t.Fatal(err)
+	}
+	html := rendered.String()
+	for _, expected := range []string{
+		"<title>Job Dashboard</title>",
+		"All jobs",
+		"Saved",
+		"class=\"dashboard-workspace\"",
+		"class=\"search-panel\"",
+		"aria-label=\"Role title, keywords, or company\"",
+		"aria-label=\"City, country, or remote\"",
+		"selected_job",
+	} {
+		if !strings.Contains(html, expected) {
+			t.Errorf("dashboard shell missing %q:\n%s", expected, html)
+		}
+	}
+	searchRow := strings.Index(html, "class=\"search-row\"")
+	queryInput := strings.Index(html, "id=\"job-search\"")
+	locationInput := strings.Index(html, "id=\"job-location\"")
+	if searchRow < 0 || queryInput < searchRow || locationInput < queryInput {
+		t.Errorf("keyword and location inputs are not in the same search row")
+	}
+	filterRow := strings.Index(html, "class=\"filter-row\"")
+	descriptionOption := strings.Index(html, "id=\"include-descriptions\"")
+	if filterRow < 0 || descriptionOption < filterRow {
+		t.Errorf("description checkbox is not in the filter row")
+	}
+	for _, removed := range []string{
+		"class=\"brand\"",
+		"class=\"breadcrumb\"",
+		"class=\"dashboard-heading\"",
+		"Explore and save indexed roles across your job boards.",
+		"class=\"search-label\"",
+	} {
+		if strings.Contains(html, removed) {
+			t.Errorf("dashboard shell still contains removed element %q:\n%s", removed, html)
+		}
+	}
+}
+
+func TestDashboardBookmarkButtonRendersSelectedJobAndProperties(t *testing.T) {
 	job := db.Job{
 		Provider:     providerGreenhouse,
 		CompanySlug:  "example",
 		ID:           42,
 		JobKey:       "42",
 		Title:        "Research Intern",
+		DetailsURL:   "https://example.test/jobs/42",
+		ApplyURL:     "https://example.test/jobs/42/application?source=board",
 		IsBookmarked: true,
 		IsAvailable:  true,
 	}
 	var rendered bytes.Buffer
-	err := browseResultsTemplate.Execute(&rendered, browsePage{
-		SavedOnly:  true,
-		Page:       1,
-		TotalPages: 1,
-		Total:      1,
-		Jobs:       []db.Job{job},
+	err := dashboardResultsTemplate.Execute(&rendered, dashboardPage{
+		SavedOnly:        true,
+		Page:             1,
+		TotalPages:       1,
+		Total:            1,
+		Jobs:             []db.Job{job},
+		SelectedJob:      job,
+		HasSelectedJob:   true,
+		SelectedProvider: job.Provider,
+		SelectedCompany:  job.CompanySlug,
+		SelectedJobKey:   job.JobKey,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	html := rendered.String()
 	for _, expected := range []string{
+		"class=\"job-list-pane\"",
+		"class=\"job job-detail-pane\"",
+		"class=\"properties-pane\"",
+		"Properties",
+		"Research Intern",
 		"♥ Saved",
+		"Apply ↗",
+		"href=\"https://example.test/jobs/42?source=board\"",
 		"hx-post=\"/bookmarks/toggle?provider=greenhouse&amp;company=example&amp;id=42&amp;saved=true\"",
 		"hx-target=\"closest .job\"",
 	} {
 		if !strings.Contains(html, expected) {
 			t.Errorf("rendered saved-job list missing %q:\n%s", expected, html)
 		}
+	}
+	if strings.Contains(html, "View role") {
+		t.Errorf("rendered job detail still has a separate view-role link:\n%s", html)
+	}
+}
+
+func TestDashboardApplyURLRemovesApplicationSuffix(t *testing.T) {
+	tests := []struct {
+		name string
+		job  db.Job
+		want string
+	}{
+		{
+			name: "apply suffix",
+			job:  db.Job{ApplyURL: "https://jobs.example.test/role/42/apply?source=board"},
+			want: "https://jobs.example.test/role/42?source=board",
+		},
+		{
+			name: "application suffix",
+			job:  db.Job{ApplyURL: "https://jobs.example.test/role/42/application"},
+			want: "https://jobs.example.test/role/42",
+		},
+		{
+			name: "details fallback",
+			job:  db.Job{DetailsURL: "https://jobs.example.test/role/42"},
+			want: "https://jobs.example.test/role/42",
+		},
+		{
+			name: "unrelated suffix",
+			job:  db.Job{ApplyURL: "https://jobs.example.test/role/42/apply-now"},
+			want: "https://jobs.example.test/role/42/apply-now",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dashboardApplyURL(tt.job); got != tt.want {
+				t.Errorf("dashboardApplyURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSelectDashboardJobUsesValidSelectionOrDefaultsFirst(t *testing.T) {
+	jobs := []db.Job{
+		{Provider: providerGreenhouse, CompanySlug: "first", JobKey: "1", Title: "First"},
+		{Provider: providerLever, CompanySlug: "second", JobKey: "2", Title: "Second"},
+	}
+	selected, ok := selectDashboardJob(jobs, url.Values{})
+	if !ok || selected.JobKey != "1" {
+		t.Fatalf("default selection = %+v, %t; want first job", selected, ok)
+	}
+	selected, ok = selectDashboardJob(jobs, url.Values{
+		"selected_provider": {"lever"},
+		"selected_company":  {"second"},
+		"selected_job":      {"2"},
+	})
+	if !ok || selected.JobKey != "2" {
+		t.Fatalf("requested selection = %+v, %t; want second job", selected, ok)
+	}
+	selected, ok = selectDashboardJob(jobs, url.Values{
+		"selected_provider": {"unknown"},
+		"selected_company":  {"missing"},
+		"selected_job":      {"nope"},
+	})
+	if !ok || selected.JobKey != "1" {
+		t.Fatalf("invalid selection fallback = %+v, %t; want first job", selected, ok)
+	}
+	if _, ok := selectDashboardJob(nil, url.Values{}); ok {
+		t.Fatal("empty results unexpectedly selected a job")
+	}
+}
+
+func TestDashboardURLsKeepFiltersAndSelection(t *testing.T) {
+	page := dashboardPage{
+		Query:               "senior engineer",
+		Location:            "New York",
+		PostedAfter:         "2026-01-01",
+		EmploymentType:      "full-time",
+		WorkplaceType:       "remote",
+		IncludeDescriptions: true,
+		SavedOnly:           true,
+		Page:                3,
+	}
+	job := db.Job{Provider: providerLever, CompanySlug: "example", JobKey: "role/42"}
+	selectedURL, err := url.Parse(dashboardSelectionURL(page, job))
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := selectedURL.Query()
+	if query.Get("q") != page.Query || query.Get("location") != page.Location ||
+		query.Get("saved") != "true" || query.Get("details") != "true" ||
+		query.Get("page") != "3" || query.Get("selected_provider") != providerLever ||
+		query.Get("selected_company") != "example" || query.Get("selected_job") != "role/42" {
+		t.Fatalf("selection URL lost state: %s", selectedURL)
+	}
+
+	pageURL, err := url.Parse(dashboardPageURL(page, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pageURL.Query().Get("page") != "4" || pageURL.Query().Get("q") != page.Query ||
+		pageURL.Query().Get("selected_job") != "" {
+		t.Fatalf("pagination URL lost filters or retained stale selection: %s", pageURL)
 	}
 }
 
@@ -420,4 +582,3 @@ func TestGreenhouseFetchJobsRateLimitsRetryWithoutStopping(t *testing.T) {
 		})
 	}
 }
-

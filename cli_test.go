@@ -30,10 +30,11 @@ func TestRootCommandHelpAndNoArgumentDefaults(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Usage:", "Provider selection:", "Company discovery:", "Request controls:",
-		"Manual proxy routing:", "Other modes and browser:", "Legacy and disabled options:",
+		"Manual proxy routing:", "Other modes and dashboard:", "Legacy and disabled options:",
 		"Commands:", "proxy", "Examples:", "crawler --greenhouse --words companies.txt",
 		"crawler proxy refresh > proxies.json",
 		"--words string", "--brute", "--greenhouse", "--collect-proxies",
+		"--dashboard",
 		// Rotating pool guidance in the overview and examples.
 		"Workers", "rotate across", "--proxy-failures",
 		"--proxies proxies.json --proxy-save proven.json",
@@ -75,11 +76,33 @@ func TestRootCommandHelpAndNoArgumentDefaults(t *testing.T) {
 	if gotProvider != providerGreenhouse {
 		t.Errorf("default provider = %q, want %q", gotProvider, providerGreenhouse)
 	}
-	if got.words != "" || got.brute || got.bench || got.update || got.browse {
+	if got.words != "" || got.brute || got.bench || got.update || got.dashboard {
 		t.Errorf("no-argument invocation unexpectedly enabled a mode: %+v", got)
 	}
 	if got.workers != 64 || got.rps != 50 || got.proxiesPath != "off" {
 		t.Errorf("unexpected CLI defaults: workers=%d rps=%g proxies=%q", got.workers, got.rps, got.proxiesPath)
+	}
+}
+
+func TestDashboardFlagAndBrowseCompatibilityAlias(t *testing.T) {
+	for _, flag := range []string{"--dashboard", "--browse"} {
+		t.Run(flag, func(t *testing.T) {
+			var got *cliOptions
+			root := newRootCommandWithRunner(func(opts *cliOptions, _ string) error {
+				got = opts
+				return nil
+			})
+			root.SetArgs([]string{flag})
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute %s: %v", flag, err)
+			}
+			if got == nil || !got.dashboard {
+				t.Fatalf("%s did not enable dashboard mode", flag)
+			}
+			if flag == "--browse" && root.Flags().Lookup("browse").Deprecated == "" {
+				t.Fatal("legacy alias is not marked deprecated")
+			}
+		})
 	}
 }
 

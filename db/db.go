@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	libsql "github.com/tursodatabase/libsql-client-go/libsql"
@@ -18,8 +19,9 @@ import (
 )
 
 type DB struct {
-	conn    *sql.DB
-	writeMu sync.Mutex
+	conn                *sql.DB
+	writeMu             sync.Mutex
+	leaseRenewalPending atomic.Bool
 }
 
 var jobSearchTerms = regexp.MustCompile(`[a-z0-9]+`)
@@ -736,7 +738,7 @@ func (d *DB) activeJobUpdateRunExists(ctx context.Context) bool {
 
 // JobUpdateRunProgress returns counts derived from durable run and target state.
 func (d *DB) JobUpdateRunProgress(ctx context.Context, runID string) (*JobUpdateRun, error) {
-	tx, err := d.conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := d.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin job update progress read: %w", err)
 	}
@@ -832,10 +834,48 @@ func randomID() (string, error) {
 	return hex.EncodeToString(bytes[:]), nil
 }
 
+func (d *DB) lockWrite(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.leaseRenewalPending.Load() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
+			continue
+		}
+		d.writeMu.Lock()
+		if err := ctx.Err(); err != nil {
+			d.writeMu.Unlock()
+			return err
+		}
+		if d.leaseRenewalPending.Load() {
+			d.writeMu.Unlock()
+			continue
+		}
+		return nil
+	}
+}
+
 // RenewJobUpdateRunLease extends ownership using database time.
 func (d *DB) RenewJobUpdateRunLease(ctx context.Context, run *JobUpdateRun) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("wait for job update run lease write lock: %w", err)
+	}
+	d.leaseRenewalPending.Store(true)
+	defer func() {
+		d.leaseRenewalPending.Store(false)
+		d.writeMu.Unlock()
+	}()
 	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("wait for job update run lease write lock: %w", err)
+	}
 	result, err := d.conn.ExecContext(ctx, `
 		UPDATE job_update_runs
 		SET lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + 60,
@@ -859,7 +899,9 @@ func (d *DB) RenewJobUpdateRunLease(ctx context.Context, run *JobUpdateRun) erro
 
 // RecordJobUpdateTargetFailure retains a safe diagnostic for a pending target.
 func (d *DB) RecordJobUpdateTargetFailure(ctx context.Context, run *JobUpdateRun, target JobUpdateTarget, category string) error {
-	d.writeMu.Lock()
+	if err := d.lockWrite(ctx); err != nil {
+		return fmt.Errorf("wait to record failed job update target: %w", err)
+	}
 	defer d.writeMu.Unlock()
 	result, err := d.conn.ExecContext(ctx, `
 		UPDATE job_update_targets
@@ -886,7 +928,9 @@ func (d *DB) RecordJobUpdateTargetFailure(ctx context.Context, run *JobUpdateRun
 
 // ReplaceProviderJobsAndCompleteTarget commits refreshed jobs and target state atomically.
 func (d *DB) ReplaceProviderJobsAndCompleteTarget(ctx context.Context, run *JobUpdateRun, target JobUpdateTarget, jobs []Job) error {
-	d.writeMu.Lock()
+	if err := d.lockWrite(ctx); err != nil {
+		return fmt.Errorf("wait to save %s/%s job update: %w", target.Provider, target.CompanySlug, err)
+	}
 	defer d.writeMu.Unlock()
 
 	tx, err := d.conn.BeginTx(ctx, nil)
@@ -1105,34 +1149,41 @@ func replaceProviderJobsTx(ctx context.Context, tx *sql.Tx, provider, slug strin
 		return fmt.Errorf("remove old %s jobs for %q: %w", provider, slug, err)
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
+	const insertBatchSize = 40
+	const insertPlaceholders = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	insertPrefix := `
 		INSERT INTO indexed_jobs (
 			provider, company_slug, job_id, title, company_name, location_name,
 			location_json, details_url, apply_url, updated_at, first_published,
 			employment_type, workplace_type, department, education, experience,
 			description, attributes_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		return fmt.Errorf("prepare %s job update for %q: %w", provider, slug, err)
-	}
-	defer stmt.Close()
+		) VALUES `
 
-	for _, job := range jobs {
-		jobID := job.JobKey
-		if jobID == "" {
-			jobID = strconv.FormatInt(job.ID, 10)
+	for batchStart := 0; batchStart < len(jobs); batchStart += insertBatchSize {
+		batchEnd := min(batchStart+insertBatchSize, len(jobs))
+		placeholders := make([]string, batchEnd-batchStart)
+		args := make([]any, 0, (batchEnd-batchStart)*18)
+		for i, job := range jobs[batchStart:batchEnd] {
+			jobID := job.JobKey
+			if jobID == "" {
+				jobID = strconv.FormatInt(job.ID, 10)
+			}
+			if jobID == "" || jobID == "0" {
+				return fmt.Errorf("job for %s company %q has an empty id", provider, slug)
+			}
+			placeholders[i] = insertPlaceholders
+			args = append(args,
+				provider, slug, jobID, job.Title, job.CompanyName,
+				job.LocationName, job.LocationJSON, job.DetailsURL, job.ApplyURL,
+				job.UpdatedAt, job.FirstPublished, job.EmploymentType, job.WorkplaceType,
+				job.Department, job.Education, job.Experience, job.Description, job.AttributesJSON,
+			)
 		}
-		if jobID == "" || jobID == "0" {
-			return fmt.Errorf("job for %s company %q has an empty id", provider, slug)
-		}
-		if _, err := stmt.ExecContext(
-			ctx, provider, slug, jobID, job.Title, job.CompanyName,
-			job.LocationName, job.LocationJSON, job.DetailsURL, job.ApplyURL,
-			job.UpdatedAt, job.FirstPublished, job.EmploymentType, job.WorkplaceType,
-			job.Department, job.Education, job.Experience, job.Description, job.AttributesJSON,
-		); err != nil {
-			return fmt.Errorf("save job %s for %s company %q: %w", jobID, provider, slug, err)
+		query := insertPrefix + strings.Join(placeholders, ", ") +
+			" ON CONFLICT(provider, company_slug, job_id) DO NOTHING"
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("save jobs %d-%d for %s company %q: %w",
+				batchStart+1, batchEnd, provider, slug, err)
 		}
 	}
 
